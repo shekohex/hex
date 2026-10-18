@@ -705,6 +705,15 @@ that can stall HFP capture; 0.5.18 contains the profile-restore fixes. Keeping t
 microphone warm avoids repeated idle profile switches but does not repair an
 already-failed Bluetooth transport.
 
+**Observed October 18, 2026, Q30 stall recovery:** repeated A2DP/HFP switching
+still stalled on WirePlumber 0.5.18; upgrading alone did not resolve this machine.
+After reselecting CVSD then mSBC, keeping the microphone open preserved three
+12-second captures with nonzero PCM across idle intervals. Idle release remains
+disabled on this installation. These probes neither called a provider nor pasted
+text. Debug and packaged release checks passed 262 tests (16 opt-in checks skipped),
+with strict all-target Clippy and formatting passing. Physical speech-to-paste
+verification after recovery remains pending.
+
 **Executed October 18, 2026, recording controls:** 260 debug Rust tests passed
 with 14 opt-in checks skipped. Strict all-target Clippy and formatting passed.
 The isolated MPRIS wire test passed separately, including the production worker's
