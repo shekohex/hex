@@ -595,19 +595,100 @@ Linux beta                               // not macOS feature parity
 ├── X11 -> No tray or recording HUD; service status and sounds remain available
 ├── Wayland -> evdev + compositor protocols; keys observed, not suppressed
 │   └── Mouse-classified nodes excluded; live modifiers reused for paste
-├── Escape -> Cancel active capture, not newest accepted job
+├── GNOME 49/50 Wayland -> HEX Shell adapter; no evdev access or XWayland fallback
+│   └── Owned shortcut press/release + clipboard paste + focused-window context + HUD
+├── Escape -> Cancel capture, otherwise newest unfinished output before insertion
 │   └── X11 grab conflict -> Try plain Escape; otherwise warn without stopping dictation
 ├── Microphone failure -> Listener exits, not macOS automatic recovery
 │   └── Overload (Xrun) glitch -> Logged; not a failure
 └── Paste -> Retain transcript clipboard, not restore previous contents
 ```
 
-No Linux Commands, Voice Action, Modes processing, retained History, or meetings.
-`hex listen` instead prints Moonshine transcripts. Wayland needs explicit broad
-input-device access; physical reconnect and click-through still need native
+No Linux Commands, Voice Action, retained History, or meetings.
+Linux cloud transcription and Modes follow the
+[provider guide](../linux.md#cloud-dictation-and-cleanup).
+`hex listen` instead prints Moonshine transcripts. The wlroots Wayland path needs
+explicit broad input-device access; physical reconnect and click-through still need native
 evidence. Its [smoke](../../scripts/test-wayland-paste.sh) explicitly isolates
 `HEX_APPLICATION_SUPPORT_DIR` and checks that Settings can exit without stopping
 the service.
+
+```ts
+Linux Settings > Models & Processing      // dictate.providers.linux
+├── Local (default) -> Downloaded model
+├── Cloud / Stream -> Compatible audio upload, optional response SSE
+└── Realtime -> Intentional capture -> Bounded audio projection -> Commit -> Final
+    └── Failure / overflow / missing final -> No partial paste
+
+Processing Modes                         // modes.providers.linux
+├── Application match -> Mode replaces Global
+├── Corrections -> Optional OpenCode / Chat / Responses / Gemini cleanup
+└── Editable instructions + model + deadline -> Ordered final paste
+    └── Failed / empty / incomplete cleanup -> Corrected transcript
+
+Mode context (off by default)             // modes.context.linux
+├── Clipboard / accessible active field -> Per-recording bounded snapshot
+├── Local OCR -> Window -> Tesseract -> Text only to cleanup
+└── Screenshot -> Window image to direct vision-capable cleanup
+    └── Unavailable source -> Omit; no whole-desktop or image-upload fallback
+```
+
+Linux additions leave macOS Modes and local SDK contracts unchanged. Gemini is
+cleanup-only. Remote selection skips local-model readiness; choosing a local
+model returns to local transcription. Old settings remain local, cleanup/context
+off. Credentials are environment/file references, never key values in IPC.
+
+Sources: [provider protocols](../../src/cloud.rs),
+[live session](../../src/cloud/realtime.rs),
+[pipeline](../../src/linux_pipeline.rs),
+[context](../../src/linux_context.rs), and
+[editor](../../src/linux_provider_settings.rs).
+[Wire tests](../../src/cloud/tests.rs) cover multipart PCM, three native cleanup
+formats, SSE framing/finalization, cancellation, live WebSocket audio, and
+OCR-mode image exclusion. Live PCM checks compare the emitted prefix against
+the final unpadded clip at 16/44.1/48 kHz; realtime checks reject queue pressure
+and retain commit order when final transcripts arrive reversed.
+Helper checks bound pipes; opt-in Tesseract checks
+synthetic pixels only. These are not live provider, physical capture/paste,
+desktop Accessibility, or screen-OCR-quality proof. OpenCode accepts OCR text,
+not image upload. Wayland needs compatible screenshot support and focused-window
+geometry; captured rectangles may include overlapping content.
+
+**Executed October 18, 2026, Linux working tree:** 249 Rust tests passed,
+13 opt-in tests ignored. The synthetic Tesseract fixture passed separately.
+Strict all-target Clippy, formatting, and the debug build passed. The isolated
+service smoke passed provider validation, private persistence, restart recovery,
+and custom-instruction/OCR-setting preservation without a display or microphone.
+Paid providers, native Settings interaction, desktop Accessibility, and physical
+capture/context/paste remain unverified.
+
+```ts
+GNOME 49/50 Wayland                       // dictate.gnome; modes.context.gnome
+├── Home Manager gnomeIntegration -> Install + enable HEX Shell adapter -> Log out/in
+├── Listener connection -> Exclusive lease -> Compositor shortcut press/release
+├── Rust capture + providers -> Modifier-neutral clipboard paste
+├── Optional context -> Clipboard / AT-SPI field / Focused-window PNG -> OCR or upload
+└── Disconnect / disable -> Release grabs + Hide HUD; no automatic permission grants
+```
+
+Sources: [Rust adapter](../../src/linux_gnome.rs),
+[Shell adapter](../../gnome/extension.js), and [Home Manager](../../nix/hm-module.nix).
+The adapter observes only its registered accelerator and reserves Escape while
+recording/processing. It rejects context and paste while locked. Conflicting
+desktop shortcuts fail explicitly; Settings uses focused shortcut capture.
+No unsafe Shell evaluation, whole-desktop fallback, evdev, wtype, or XWayland.
+The click-through Shell HUD replaces the wlroots layer-shell overlay.
+
+Executed on the Linux working tree: 251 Rust tests, five compositor-mock adapter
+checks, and strict all-target Clippy passed. Mocks cover lease ownership, cleanup,
+shortcut conflicts, focus changes, balanced key releases, and locked-desktop
+rejection. A synthetic PNG also passed native GJS/GdkPixbuf resize, PNG encoding,
+and memory-stream checks without screen access. The dotfiles-selected Nix release
+package passed the same 251 Rust and five adapter tests plus the isolated service
+smoke. Home Manager module checks and dotfiles flake evaluation passed; no NixOS
+activation was performed. These do not establish physical GNOME input, clipboard consumption,
+window pixel capture, or native HUD behavior. See the
+[GNOME setup](../linux.md#native-gnome-wayland).
 
 Wayland discovery checks every event node for the required broad read access,
 then excludes udev mouse-classified nodes even when Logitech-style receivers

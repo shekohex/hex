@@ -132,17 +132,22 @@ pub(crate) struct LinuxIndicator {
 
 impl LinuxIndicator {
     pub(crate) fn new() -> Self {
-        let generation = LinuxSession::detect().is_wayland().then(|| {
-            runtime()
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .indicator
-                .acquire()
-        });
+        let generation = (LinuxSession::detect().is_wayland() && !crate::linux_gnome::is_gnome())
+            .then(|| {
+                runtime()
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .indicator
+                    .acquire()
+            });
         Self { generation }
     }
     pub(crate) fn update(&self, recording: bool, pending: usize) {
+        if crate::linux_gnome::is_gnome() {
+            crate::linux_gnome::set_indicator(recording, pending);
+            return;
+        }
         if let Some(generation) = self.generation {
             runtime()
                 .state

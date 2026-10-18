@@ -13,13 +13,15 @@ mod apple_speech;
 mod application_catalog;
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod audio;
+#[cfg(target_os = "linux")]
+mod cloud;
 #[cfg(target_os = "macos")]
 mod command_grammar;
 #[cfg(target_os = "macos")]
 mod commands;
 #[cfg(target_os = "macos")]
 mod config;
-#[cfg(target_os = "macos")]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod context;
 #[cfg(all(debug_assertions, target_os = "macos"))]
 mod dashboard;
@@ -42,7 +44,7 @@ mod dictation_audio;
 mod dictation_diagnostics;
 #[cfg(target_os = "macos")]
 mod dictation_indicator;
-#[cfg(target_os = "macos")]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod dictation_processor;
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod events;
@@ -61,13 +63,21 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod linux_app;
 #[cfg(target_os = "linux")]
+mod linux_context;
+#[cfg(target_os = "linux")]
 mod linux_desktop;
 #[cfg(target_os = "linux")]
 mod linux_dictation;
 #[cfg(target_os = "linux")]
+mod linux_gnome;
+#[cfg(target_os = "linux")]
 mod linux_input;
 #[cfg(target_os = "linux")]
 mod linux_paste;
+#[cfg(target_os = "linux")]
+mod linux_pipeline;
+#[cfg(target_os = "linux")]
+mod linux_provider_settings;
 #[cfg(target_os = "linux")]
 mod linux_service;
 #[cfg(target_os = "linux")]
@@ -122,9 +132,8 @@ mod spoken_text;
 mod status_item;
 #[cfg(target_os = "macos")]
 mod suppression;
-#[cfg(target_os = "macos")]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod text_input;
-#[cfg(target_os = "macos")]
 mod text_replacements;
 #[cfg(target_os = "macos")]
 mod transcription;

@@ -88,6 +88,31 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert snapshot()["pid"] == service.pid
         assert json.loads((support / "linux-settings.json").read_text())["sound_effect_volume"] == 0
 
+        # Provider configuration persists through the service without local models,
+        # network calls, or touching a real device. This listener is already idle.
+        providers = {
+            "cloud_transcription": {
+                "connection": {"base_url": "http://127.0.0.1:9/v1", "api_key_env": ""},
+                "model": "fixture-transcriber", "mode": "realtime",
+            },
+            "processing": {"default_mode": {
+                "enabled": True, "backend": "responses", "model": "fixture-cleanup",
+                "prompt": "Keep my custom instructions. Preserve العربية.",
+                "context": {"screen": "ocr", "ocr_languages": "eng"},
+            }},
+        }
+        with connection() as client:
+            assert call(client, {"ConfigureProviders": providers})["error"] is None
+        state = wait_for(lambda: (s := snapshot()) and not s["editing"]
+                         and s["settings"]["cloud_transcription"] and s)
+        assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
+        assert state["settings"]["sound_effect_volume"] == 0
+        assert stat.S_IMODE((support / "linux-settings.json").stat().st_mode) == 0o600
+        invalid = providers | {"cloud_transcription": providers["cloud_transcription"] | {"model": ""}}
+        with connection() as client:
+            assert call(client, {"ConfigureProviders": invalid})["error"]
+        assert snapshot()["settings"] == state["settings"]
+
         # Disconnecting an uncommitted focused shortcut capture releases only that edit.
         with connection() as client:
             assert call(client, "CaptureShortcut")["state"]["capturing"]
@@ -120,6 +145,9 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         state = wait_for(snapshot)
         assert state["pid"] == service.pid
         assert state["settings"]["sound_effect_volume"] == 0
+        assert state["settings"]["cloud_transcription"]["mode"] == "realtime"
+        assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
+        assert state["settings"]["processing"]["default_mode"]["context"]["screen"] == "ocr"
         subprocess.run([binary, "stop"], env=env, check=True, capture_output=True)
         assert service.wait(timeout=8) == 0
         assert not path.exists()

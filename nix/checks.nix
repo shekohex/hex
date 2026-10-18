@@ -22,6 +22,10 @@ let
     autostart = true;
   };
   manual = home { enable = true; };
+  gnome = home {
+    enable = true;
+    gnomeIntegration = true;
+  };
   disabled = home { enable = false; };
   custom = home {
     enable = true;
@@ -80,13 +84,16 @@ in
     assert builtins.elem hex enabled.home.packages;
     assert !(builtins.elem hex disabled.home.packages);
     assert manual.systemd.user.services.hex.Install.WantedBy == [ ];
+    assert lib.hasInfix "hex@shekohex.dev" (toString gnome.dconf.settings."org/gnome/shell".enabled-extensions);
+    assert
+      gnome.xdg.dataFile."gnome-shell/extensions/hex@shekohex.dev".source
+      == "${hex}/share/gnome-shell/extensions/hex@shekohex.dev";
     assert !(disabled.systemd.user.services ? hex);
     assert enabled.systemd.user.services.hex.Service.ExecStart == [ "${lib.getExe hex} service" ];
     assert enabled.systemd.user.services.hex.Service.Restart == "on-failure";
     assert builtins.elem "HEX_APPLICATION_SUPPORT_DIR=${enabled.xdg.dataHome}/voice-control"
       enabled.systemd.user.services.hex.Service.Environment;
-    assert
-      custom.systemd.user.services.hex.Service.ExecStart == [ "${lib.getExe pkgs.hello} service" ];
+    assert custom.systemd.user.services.hex.Service.ExecStart == [ "${lib.getExe pkgs.hello} service" ];
     assert lib.all (name: custom.systemd.user.services.hex.Unit.${name} == [ "sway-session.target" ]) [
       "After"
       "PartOf"

@@ -177,11 +177,21 @@ struct HotkeyState {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct WaylandModifierState(Arc<AtomicU8>);
+pub(crate) struct WaylandModifierState {
+    held: Arc<AtomicU8>,
+    output_pending: Arc<AtomicBool>,
+}
 
 impl WaylandModifierState {
+    pub(crate) fn with_output_pending(output_pending: Arc<AtomicBool>) -> Self {
+        Self {
+            output_pending,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn held(&self) -> bool {
-        self.0.load(Ordering::Acquire) != 0
+        self.held.load(Ordering::Acquire) != 0
     }
 
     fn publish(&self, modifiers: [bool; 4]) {
@@ -189,7 +199,7 @@ impl WaylandModifierState {
             .into_iter()
             .enumerate()
             .fold(0_u8, |bits, (index, held)| bits | (u8::from(held) << index));
-        self.0.store(bits, Ordering::Release);
+        self.held.store(bits, Ordering::Release);
     }
 }
 
@@ -237,7 +247,12 @@ impl HotkeyState {
         let (key, down) = self.pressed.update(input)?;
         self.modifiers.publish(self.pressed.modifiers());
         if key == KeyCode::KEY_ESC && down {
-            return self.cancel();
+            return self.cancel().or_else(|| {
+                self.modifiers
+                    .output_pending
+                    .load(Ordering::Acquire)
+                    .then_some(HotkeyEvent::Cancel)
+            });
         }
         let modifiers = self.pressed.modifiers();
         if let Capture::Held { second_tap } = self.capture {
@@ -639,6 +654,35 @@ fn should_monitor_input(is_mouse: bool, supports_hotkeys: bool) -> bool {
 mod tests {
     use super::*;
     use HotkeyEvent::{Cancel, Finish, Start};
+
+    #[test]
+    fn idle_escape_cancels_pending_output_but_not_ordinary_idle_input() {
+        let modifiers = WaylandModifierState::default();
+        let mut state =
+            HotkeyState::with_modifiers(&LinuxHotkey::default(), false, modifiers.clone()).unwrap();
+        let path = PathBuf::from("/test/keyboard");
+        state.update(
+            Input::Connected(path.clone(), HashSet::new()),
+            Instant::now(),
+        );
+        assert!(
+            state
+                .update(
+                    Input::Key(path.clone(), KeyCode::KEY_ESC, 1),
+                    Instant::now()
+                )
+                .is_none()
+        );
+        state.update(
+            Input::Key(path.clone(), KeyCode::KEY_ESC, 0),
+            Instant::now(),
+        );
+        modifiers.output_pending.store(true, Ordering::Release);
+        assert_eq!(
+            state.update(Input::Key(path, KeyCode::KEY_ESC, 1), Instant::now()),
+            Some(Cancel)
+        );
+    }
 
     struct Test {
         state: HotkeyState,

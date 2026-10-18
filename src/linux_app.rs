@@ -62,6 +62,7 @@ enum SettingsChange {
     Hotkey(crate::linux_settings::LinuxHotkey),
     DoubleTap(bool),
     PasteWithShift(bool),
+    Providers(Box<crate::linux_settings::ProviderConfiguration>),
 }
 
 struct SettingsEdit {
@@ -127,6 +128,7 @@ struct LinuxApp {
     host: RemoteHost,
     quitting: bool,
     transcription_picker: TranscriptionPickerState,
+    provider_editor: Option<gpui::Entity<crate::linux_provider_settings::ProviderEditor>>,
 }
 
 enum TranscriptionPickerState {
@@ -362,6 +364,17 @@ pub fn run_service(event_path: PathBuf, shutdown: &'static AtomicBool) -> Result
                             host.begin_settings_edit(SettingsChange::PasteWithShift(value))
                         }
                         Request::SetVolume(value) => host.set_sound_effect_volume(value)?,
+                        Request::ConfigureProviders(configuration) => {
+                            configuration.validate()?;
+                            if host.settings_edit.is_some()
+                                || host.transcription_preparation.is_some()
+                            {
+                                return Err(color_eyre::eyre::eyre!(
+                                    "Wait for the current settings change to finish"
+                                ));
+                            }
+                            host.begin_settings_edit(SettingsChange::Providers(configuration));
+                        }
                         Request::ChooseModel { model, language } => {
                             host.choose_transcription(model, language)?
                         }
@@ -387,6 +400,15 @@ pub fn open(start_hidden: bool, shutdown: &'static AtomicBool) -> Result<()> {
         return linux_service::start();
     }
     Application::new().run(move |cx: &mut App| {
+        cx.bind_keys(crate::text_input::key_bindings());
+        cx.bind_keys([
+            gpui::KeyBinding::new("ctrl-a", crate::text_input::SelectAll, Some("TextInput")),
+            gpui::KeyBinding::new("ctrl-c", crate::text_input::Copy, Some("TextInput")),
+            gpui::KeyBinding::new("ctrl-v", crate::text_input::Paste, Some("TextInput")),
+            gpui::KeyBinding::new("ctrl-x", crate::text_input::Cut, Some("TextInput")),
+            gpui::KeyBinding::new("ctrl-z", crate::text_input::Undo, Some("TextInput")),
+            gpui::KeyBinding::new("ctrl-shift-z", crate::text_input::Redo, Some("TextInput")),
+        ]);
         let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
         let window = cx
             .open_window(
@@ -402,6 +424,7 @@ pub fn open(start_hidden: bool, shutdown: &'static AtomicBool) -> Result<()> {
                         host: RemoteHost::new(),
                         quitting: false,
                         transcription_picker: TranscriptionPickerState::Closed,
+                        provider_editor: None,
                     })
                 },
             )
@@ -425,6 +448,13 @@ pub fn open(start_hidden: bool, shutdown: &'static AtomicBool) -> Result<()> {
                             this.request_quit();
                         }
                         this.host.refresh();
+                        if let Some(editor) = &this.provider_editor {
+                            let busy = this.host.editing_settings();
+                            let error = this.host.snapshot().operation_error;
+                            editor.update(cx, |editor, cx| {
+                                editor.observe_service(&this.host.settings, busy, error, cx)
+                            });
+                        }
                         if this.quitting {
                             cx.quit();
                         }
@@ -524,7 +554,11 @@ impl LinuxDesktopHost {
             return;
         }
         let model = crate::transcription_models::definition(self.settings.transcription.model);
-        if !crate::transcription_models::is_installed(model, &self.settings.transcription.language)
+        if self.settings.cloud_transcription.is_none()
+            && !crate::transcription_models::is_installed(
+                model,
+                &self.settings.transcription.language,
+            )
         {
             self.status = "Model required".into();
             return;
@@ -615,6 +649,7 @@ impl LinuxDesktopHost {
                     Ok(prepared) => {
                         let mut candidate = self.settings.clone();
                         candidate.transcription = prepared.selection;
+                        candidate.cloud_transcription = None;
                         match candidate.save() {
                             Ok(()) => {
                                 self.settings = candidate;
@@ -783,6 +818,9 @@ impl LinuxDesktopHost {
                 // Once persistence completed, keep the in-memory projection consistent even
                 // if Cancel raced with the final atomic save.
                 Ok(Ok(settings)) => {
+                    if matches!(edit.change, SettingsChange::Providers(_)) {
+                        self.prepared_transcriber = None;
+                    }
                     self.settings = settings;
                     self.settings_valid = true;
                     self.settings_error = None;
@@ -796,7 +834,7 @@ impl LinuxDesktopHost {
                 _ => {}
             }
         } else if !canceled {
-            let wayland = LinuxSession::detect().is_wayland();
+            let wayland = LinuxSession::detect().is_wayland() && !crate::linux_gnome::is_gnome();
             if !wayland && matches!(edit.change, SettingsChange::Capture) {
                 // X11 uses focused GPUI keystrokes, never raw input-device access.
                 self.status = "Press a shortcut".into();
@@ -817,6 +855,11 @@ impl LinuxDesktopHost {
                     }
                     SettingsChange::PasteWithShift(enabled) => {
                         candidate.paste_with_shift = enabled;
+                        None
+                    }
+                    SettingsChange::Providers(configuration) => {
+                        candidate.cloud_transcription = configuration.cloud_transcription;
+                        candidate.processing = configuration.processing;
                         None
                     }
                 };
@@ -943,7 +986,9 @@ impl LinuxApp {
             self.host.cancel_settings_edit();
             return true;
         }
-        if LinuxSession::detect().is_wayland() || self.host.is_running() {
+        if (LinuxSession::detect().is_wayland() && !crate::linux_gnome::is_gnome())
+            || self.host.is_running()
+        {
             return false;
         }
         let shortcut = DesktopShortcut {
@@ -1078,7 +1123,7 @@ impl DesktopHost for LinuxDesktopHost {
 }
 
 impl LinuxApp {
-    fn render_shared_navigation(&self) -> AnyElement {
+    fn render_shared_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
         sidebar_frame()
             .w(px(SIDEBAR_WIDTH))
             .px(px(14.0))
@@ -1087,9 +1132,46 @@ impl LinuxApp {
             .flex()
             .flex_col()
             .child(
-                navigation_item(NavigationIcon::Settings, true)
+                navigation_item(NavigationIcon::Settings, self.provider_editor.is_none())
                     .id("linux-nav-settings")
-                    .child("Settings"),
+                    .child("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.provider_editor = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                navigation_item(NavigationIcon::Modes, self.provider_editor.is_some())
+                    .id("linux-nav-providers")
+                    .child("Models & Processing")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.provider_editor.is_some() || this.host.client.state.is_none() {
+                            return;
+                        }
+                        let configuration = crate::linux_settings::ProviderConfiguration {
+                            cloud_transcription: this.host.settings.cloud_transcription.clone(),
+                            processing: this.host.settings.processing.clone(),
+                        };
+                        let editor = cx.new(|cx| {
+                            crate::linux_provider_settings::ProviderEditor::new(configuration, cx)
+                        });
+                        cx.subscribe(
+                            &editor,
+                            |this,
+                             _,
+                             configuration: &crate::linux_settings::ProviderConfiguration,
+                             cx| {
+                                let _ = this.host.send(Request::ConfigureProviders(Box::new(
+                                    configuration.clone(),
+                                )));
+                                cx.notify();
+                            },
+                        )
+                        .detach();
+                        this.transcription_picker = TranscriptionPickerState::Closed;
+                        this.provider_editor = Some(editor);
+                        cx.notify();
+                    })),
             )
             .child(div().flex_1())
             .into_any_element()
@@ -1146,11 +1228,19 @@ impl LinuxApp {
         };
         let update_ready = snapshot.update_status == DesktopUpdateStatus::ReadyToRestart;
         let transcription = &snapshot.transcription;
-        let transcription_label = format!(
-            "{} · {}",
-            crate::transcription_models::language_name(&transcription.selection.language),
-            crate::transcription_models::definition(transcription.selection.model).name
-        );
+        let transcription_label = self
+            .host
+            .settings
+            .cloud_transcription
+            .as_ref()
+            .map(|cloud| format!("Cloud · {}", cloud.model))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} · {}",
+                    crate::transcription_models::language_name(&transcription.selection.language),
+                    crate::transcription_models::definition(transcription.selection.model).name
+                )
+            });
         let transcription_language = transcription.selection.language.clone();
 
         div()
@@ -1461,7 +1551,11 @@ impl TranscriptionPickerDelegate for LinuxApp {
 impl Render for LinuxApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.host.snapshot();
-        let content = self.render_shared_settings(&snapshot, cx);
+        let content = if let Some(editor) = &self.provider_editor {
+            editor.clone().into_any_element()
+        } else {
+            self.render_shared_settings(&snapshot, cx)
+        };
         let model_picker =
             self.transcription_picker
                 .language()
@@ -1473,7 +1567,7 @@ impl Render for LinuxApp {
                     )
                 });
         window_frame()
-            .child(self.render_shared_navigation())
+            .child(self.render_shared_navigation(cx))
             .child(
                 div()
                     .flex_1()

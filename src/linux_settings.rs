@@ -22,6 +22,27 @@ pub struct LinuxSettings {
     pub paste_with_shift: bool,
     pub sound_effect_volume: f32,
     pub transcription: crate::transcription_models::TranscriptionSelection,
+    pub cloud_transcription: Option<crate::cloud::TranscriptionSettings>,
+    pub processing: crate::linux_pipeline::PipelineSettings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ProviderConfiguration {
+    pub cloud_transcription: Option<crate::cloud::TranscriptionSettings>,
+    pub processing: crate::linux_pipeline::PipelineSettings,
+}
+
+impl ProviderConfiguration {
+    pub fn validate(&self) -> Result<()> {
+        if serde_json::to_vec(self)?.len() > 96 * 1024 {
+            return Err(eyre!("Provider configuration exceeds 96 KiB"));
+        }
+        if let Some(cloud) = &self.cloud_transcription {
+            cloud.validate()?;
+        }
+        self.processing.validate()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,6 +64,8 @@ impl Default for LinuxSettings {
             paste_with_shift: false,
             sound_effect_volume: 0.5,
             transcription: crate::transcription_models::TranscriptionSelection::default(),
+            cloud_transcription: None,
+            processing: Default::default(),
         }
     }
 }
@@ -76,9 +99,16 @@ impl LinuxSettings {
         Ok(settings)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if serde_json::to_vec(self)?.len() > 112 * 1024 {
+            return Err(eyre!("Linux settings exceed the service snapshot limit"));
+        }
         self.dictation_hotkey.validate()?;
         crate::transcription_models::validate(&self.transcription)?;
+        if let Some(cloud) = &self.cloud_transcription {
+            cloud.validate()?;
+        }
+        self.processing.validate()?;
         if !(0.0..=1.0).contains(&self.sound_effect_volume) {
             return Err(eyre!("Sound volume must be between zero and one"));
         }
@@ -91,7 +121,15 @@ impl LinuxSettings {
         let directory = path.parent().unwrap();
         fs::create_dir_all(directory)?;
         let partial = path.with_extension("json.partial");
-        let mut file = File::create(&partial)?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&partial)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         serde_json::to_writer_pretty(&mut file, self)?;
         file.write_all(b"\n")?;
         file.sync_all()?;

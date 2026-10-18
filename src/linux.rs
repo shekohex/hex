@@ -53,6 +53,11 @@ enum Command {
         #[arg(long)]
         lines: Option<usize>,
     },
+    /// Configure cloud dictation and per-application cleanup pipelines.
+    Providers {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
     /// Install, inspect, and validate the local dictation model.
     Model {
         #[command(subcommand)]
@@ -72,6 +77,14 @@ enum ModelCommand {
     Check,
     /// Transcribe a WAV file with the installed model.
     Transcribe { wav: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    /// Print provider configuration (credentials are references, never key values).
+    Show,
+    /// Apply a JSON configuration through the service; drains and resumes listening.
+    Configure { file: PathBuf },
 }
 
 pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
@@ -126,6 +139,39 @@ pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&state)?);
             Ok(())
         }
+        Command::Providers { command } => match command {
+            ProviderCommand::Show => {
+                let state = crate::linux_service::request(crate::linux_service::Request::Snapshot)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::linux_settings::ProviderConfiguration {
+                        cloud_transcription: state.settings.cloud_transcription,
+                        processing: state.settings.processing,
+                    })?
+                );
+                Ok(())
+            }
+            ProviderCommand::Configure { file } => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(file)?
+                    .take(96 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > 96 * 1024 {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Provider configuration exceeds 96 KiB"
+                    ));
+                }
+                let configuration: crate::linux_settings::ProviderConfiguration =
+                    serde_json::from_slice(&bytes)?;
+                configuration.validate()?;
+                crate::linux_service::request(crate::linux_service::Request::ConfigureProviders(
+                    Box::new(configuration),
+                ))?;
+                println!("Provider settings queued; check hex status for completion.");
+                Ok(())
+            }
+        },
         Command::Model { command } => match command {
             ModelCommand::Status => {
                 let model = crate::linux_transcriber::default_model();

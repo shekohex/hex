@@ -1,16 +1,19 @@
 # Install The Linux Beta
 
-The Linux beta targets x86_64 Linux: i3/X11 and compatible wlroots-based Wayland
-compositors such as Hyprland or Sway. Audio uses ALSA, including PipeWire systems
-with ALSA compatibility. Inference uses Vulkan when available and can fall back
+The Linux beta targets x86_64 Linux: i3/X11, GNOME 49/50 Wayland with the HEX
+Shell extension, and compatible wlroots-based Wayland compositors such as
+Hyprland or Sway. Audio uses ALSA, including PipeWire systems
+with ALSA compatibility. Local inference uses Vulkan when available and can fall back
 to the CPU. The GPUI Settings window still needs a Vulkan driver, even with CPU
 inference; `vulkan-icd-loader` alone is not a driver. Install a driver for your GPU
 or a software Vulkan driver. See the Wayland requirements below before enabling
 native input.
 
-The beta does not support voice commands, application or browser context, or
-meetings. This is not universal Wayland support: GNOME and KDE are not covered
-by the current clipboard, virtual-keyboard, and overlay protocol contract.
+The beta supports optional cloud transcription and application-selected cleanup
+with clipboard, accessible field, and focused-window context. It does not support
+voice commands, browser-domain activation, or meetings.
+This is not universal Wayland support. GNOME uses its dedicated adapter below;
+KDE is not covered by the wlroots clipboard, keyboard, and overlay contract.
 
 For Nix/NixOS, use the [Nix guide](nix.md). Nix owns updates to that installation;
 HEX's signed updater owns only the direct-install layout below.
@@ -127,6 +130,9 @@ stops listening and restores the previous running state after the edit.
 Cancelling shortcut capture preserves the old binding unless the new binding
 has already been saved; listening resumes only if it was previously running.
 
+With no active capture, Escape cancels the newest unfinished output before its
+insertion commits. Starting another recording does not cancel accepted work.
+
 On X11, HEX first grabs Escape with any modifiers. If another application owns
 a modified Escape shortcut, HEX falls back to plain Escape with Caps/Num Lock
 variants; release other modifiers before cancelling. If plain Escape also
@@ -160,7 +166,140 @@ clipboard formats are not restored. A short settling delay prevents immediate
 back-to-back replacement, but is not an acknowledgment from a stalled target
 application (see [#24](https://github.com/anomalyco/hex/issues/24)).
 
+## Cloud Dictation And Cleanup
+
+Open **Models & Processing** in Linux Settings. Local transcription remains default.
+Cloud selection needs no local model download. GUI and `hex dictate` use saved settings.
+
+```ts
+Transcription                            // independent of cleanup
+├── Local -> Existing downloaded model
+├── Cloud -> OpenAI-compatible audio/transcriptions upload
+├── Stream -> Same upload, streamed transcript response
+└── Realtime -> Intentional recording -> Live audio -> Release -> Commit -> Final
+
+Processing Modes
+├── Matching application -> That mode, replacing Global
+└── Otherwise -> Global
+    └── Corrections -> Optional cleanup -> One final paste
+```
+
+Enter API base URL and exact model ID. Transcription needs the provider's
+`/audio/transcriptions` or GA `/realtime?intent=transcription` contract;
+Chat Completions compatibility alone does not imply either exists. File-response
+streaming is not live audio input. Realtime disables server turn detection: the
+shortcut controls finalization. Uploads split into 120-second requests; realtime
+commits bounded turns. Disconnects, queue pressure, and missing final acknowledgments
+fail without pasting partial text. No automatic provider/local fallback.
+Language hints use the current OpenAI models' `languages` list; legacy and other
+compatible models keep the singular `language` contract. See the
+[OpenAI transcription contract](https://developers.openai.com/api/docs/guides/transcription).
+
+Cleanup backends: **OpenCode**, **Chat Completions**, **Responses**, native **Gemini**.
+Gemini is cleanup-only. OpenCode stays optional and uses existing `opencode2`
+provider setup. Its model field accepts `provider/model`, or empty for Automatic;
+`VOICE_CONTROL_OPENCODE_CLI` can select an executable. Gemini's base URL defaults
+to `https://generativelanguage.googleapis.com/v1beta`.
+
+Each mode has editable instructions, model, deadline, and context choices. New
+modes start with the programming-cleanup prompt; saved custom instructions are
+preserved. Application matching is exact and case-insensitive: WM_CLASS on X11,
+class on Hyprland, app_id/class on Sway, or application names exposed by AT-SPI.
+Modes replace Global rather than layering. JSON `replacements` entries support
+`matched_phrase` and `output`. Cleanup failure preserves corrected transcription.
+
+### Credentials
+
+Keys never enter settings or IPC snapshots. Configure an environment-variable
+**name**, or an absolute path to a user-owned regular key file with mode `0600`.
+Key file takes precedence. Enter secrets using an editor, not argv.
+Environment variables must exist in the **service's** environment; terminal exports
+do not automatically reach systemd. Use a private `EnvironmentFile` in a
+`hex.service` user-unit override, then restart. Leave both fields empty for an
+unauthenticated local-compatible server. Requests never follow redirects.
+
+### Context And Local OCR
+
+Context defaults off. Only enabled sources go to cleanup, never the speech model.
+Each recording owns its snapshot; context and images are not retained in settings
+or diagnostic events.
+
+```ts
+Screen context
+├── Off -> No window image capture
+├── Local OCR -> Focused window pixels -> Tesseract -> Send text only
+└── Screenshot -> Focused window pixels -> Send image to vision-capable model
+```
+
+OCR works with OpenCode too. Install Tesseract and language data; set **OCR
+languages** to installed codes such as `eng` or `eng+ara`. Nix bundles English;
+additional data can be supplied through the service's `TESSDATA_PREFIX`.
+OCR uses a higher-resolution local image than upload. Pixels use memory/stdin,
+not temporary files. OCR runs off the audio thread with bounded I/O and time;
+missing/failed optional sources are omitted, never replaced with image upload.
+
+Clipboard context uses the Shell adapter on GNOME, `xclip` on X11, or `wl-paste`
+on wlroots Wayland. Focused field
+text uses read-only AT-SPI; applications must expose it. Known password fields
+are excluded. No synthetic Copy or focus changes. Window capture uses X11 window
+pixels, GNOME's focused-window API, or `grim` over a focused-window rectangle on
+compatible wlroots Wayland compositors.
+Hyprland/Sway use compositor IPC; otherwise AT-SPI must expose active-window
+geometry. A Wayland rectangle may include overlapping content. No whole-desktop
+fallback. Nix includes clipboard, screenshot, and OCR helpers.
+
+### CLI Configuration
+
+```sh
+hex providers show > providers.json
+# Edit configuration; credentials remain references, never key values.
+hex providers configure providers.json
+hex status
+```
+
+Configure acknowledges admission; `hex status` shows completion/errors. Saving
+stops and restores a previously running listener, like other Linux settings edits.
+Do not change providers during recording or pending output. Settings owns no
+microphone or provider connection.
+
+Wire tests use loopback HTTP/WebSocket fixtures, not paid APIs or a microphone.
+The opt-in `local_ocr_reads_fixture_pixels_without_persisting_an_image` check
+uses a synthetic PNG and Tesseract, never the screen. These do not prove live
+provider availability, desktop context support, or target-app insertion.
+
+## Native GNOME Wayland
+
+GNOME 49/50 uses the bundled **HEX** Shell extension (`hex@shekohex.dev`). With
+Home Manager, enable `programs.hex.gnomeIntegration = true`; log out and back in
+after first installation so Shell discovers it. No unsafe Shell mode, XWayland
+fallback, root service, or `/dev/input` access is required.
+
+The extension adapts compositor shortcuts, clipboard insertion, focused-window
+capture, and the click-through recording/processing indicator. Rust still owns
+recording, double-tap locking, cancellation, provider calls, and output order.
+Its D-Bus lease belongs to one listener connection; disconnect/disable releases
+shortcut grabs and hides the indicator. Locked desktops reject context and paste.
+Only the registered shortcut is observed, not arbitrary physical keys.
+
+Choose an unused shortcut in Settings before starting. GNOME often reserves
+Alt-Space for its window menu; conflicts fail explicitly rather than changing
+desktop bindings. Shortcut capture uses focused Settings input, not evdev.
+Paste waits for physical modifiers and keeps the transcript clipboard, like
+other Linux backends. No transcript is placed in helper arguments.
+
+OCR and image upload both capture only the focused window, in memory, without
+a screen picker on each dictation. Context stays opt-in. Local OCR still runs
+through Tesseract; only its text reaches cleanup. No whole-desktop fallback.
+Disabling the extension makes the listener fail visibly; Settings remains usable.
+
+Adapter tests use compositor mocks, not the live Shell. Physical shortcut,
+context, paste, and HUD behavior still require native verification after login.
+API references: [Mutter accelerators](https://gnome.pages.gitlab.gnome.org/mutter/meta/method.Display.grab_accelerator.html),
+[focused-window capture](https://gnome.pages.gitlab.gnome.org/gnome-shell/shell/method.Screenshot.screenshot_window.html).
+
 ## Native Wayland Requirements
+
+These requirements apply to the wlroots backend; GNOME uses the adapter above.
 
 - Export the compositor's nonempty `WAYLAND_DISPLAY` in the launch environment.
   HEX, GTK, and GPUI select the same native backend even when XWayland's

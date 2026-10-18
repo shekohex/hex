@@ -39,7 +39,6 @@ pub fn init_process_logging(shutdown: &'static AtomicBool) -> Result<PathBuf> {
     Ok(log_dir)
 }
 
-#[cfg(target_os = "macos")]
 pub fn opencode_workspace() -> Result<PathBuf> {
     Ok(support_dir()?.join("opencode"))
 }

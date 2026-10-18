@@ -1,7 +1,8 @@
 # Linux Plan
 
 **Status:** Active validation and capability plan. The x86_64 X11 beta,
-wlroots-compatible native Wayland path, and Nix packaging are implemented.
+wlroots-compatible native Wayland path, GNOME 49/50 Shell adapter, and Nix
+packaging are implemented.
 Physical desktop/input validation and a genuine signed update remain release
 gates; automated checks alone do not establish those behaviors.
 
@@ -13,24 +14,32 @@ The Linux beta keeps its contracts explicit:
 | --- | --- |
 | Distribution | Signed user-local direct install, or Nix-owned package updates |
 | Host | x86_64 Linux; Arch/i3 reference and NixOS packaging |
-| Desktop | i3/X11 or compatible wlroots Wayland compositor |
+| Desktop | i3/X11, GNOME 49/50 with HEX extension, or compatible wlroots Wayland |
 | Audio | CPAL through ALSA, typically backed by PipeWire |
 | Inference | Vulkan with CPU fallback |
 | Shortcut | Configurable key-containing chord; default `Alt+Space` |
 | Insertion | Clipboard plus Ctrl-V, with a Ctrl-Shift-V terminal setting |
-| UI | On-demand GPUI service client; no tray; service-owned Wayland layer-shell HUD |
+| UI | On-demand GPUI service client; no tray; Shell or layer-shell HUD |
 
-The beta does not claim voice commands, application or browser context,
-meetings, or universal Wayland support. Wayland needs explicit read access to
+The beta does not claim voice commands, browser-domain activation,
+meetings, or universal Wayland support. The wlroots path needs explicit read access to
 all event devices, `wl-copy`, `wtype`, and compatible compositor protocols.
 There is no hidden XWayland or privileged injection fallback. See
 [`../linux.md`](../linux.md) and [`../nix.md`](../nix.md).
+
+GNOME's extension uses a listener-owned D-Bus lease for shortcuts, clipboard
+paste, focused-window context, and HUD. It does not need evdev permissions.
+Compositor mocks are not native desktop proof.
 
 ## What Is Implemented
 
 - Global hold/release dictation, Escape cancellation, and double-tap lock.
 - Configurable persisted shortcut binding.
 - Local model installation and transcription.
+- Optional compatible cloud upload/SSE/realtime transcription and per-app
+  OpenCode/Chat/Responses/Gemini cleanup with editable instructions.
+- Opt-in clipboard, accessible field, local OCR, or window-image cleanup context;
+  see [setup and limits](../linux.md#cloud-dictation-and-cleanup).
 - Automatic clipboard insertion with bounded settling. The transcript remains
   on the clipboard; arbitrary previous formats are not restored.
 - CLI microphone override.

@@ -24,6 +24,7 @@ in
       description = "HEX package to install.";
     };
     autostart = lib.mkEnableOption "HEX startup with the graphical session";
+    gnomeIntegration = lib.mkEnableOption "the HEX GNOME Shell integration (GNOME 49/50)";
     systemdTarget = lib.mkOption {
       type = lib.types.str;
       default = "graphical-session.target";
@@ -37,6 +38,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    xdg.dataFile = lib.mkIf cfg.gnomeIntegration {
+      "gnome-shell/extensions/hex@shekohex.dev".source =
+        "${cfg.package}/share/gnome-shell/extensions/hex@shekohex.dev";
+    };
+    dconf.settings = lib.mkIf cfg.gnomeIntegration {
+      "org/gnome/shell".enabled-extensions = lib.mkAfter [ "hex@shekohex.dev" ];
+    };
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.system == "x86_64-linux";

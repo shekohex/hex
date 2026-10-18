@@ -23,6 +23,10 @@
   curl,
   wl-clipboard,
   wtype,
+  grim,
+  xclip,
+  tesseract,
+  nodejs,
   wrapGAppsHook3,
   autoAddDriverRunpath,
   symlinkJoin,
@@ -65,6 +69,9 @@ let
     curl
     wl-clipboard
     wtype
+    grim
+    xclip
+    (tesseract.override { enableLanguages = [ "eng" ]; })
   ];
 in
 rustPlatform.buildRustPackage (finalAttrs: {
@@ -83,6 +90,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../resources
       ../assets
       ../packaging
+      ../gnome
     ];
   };
 
@@ -126,9 +134,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
   env = buildEnv;
   # Desktop and installed-model tests are #[ignore]; run the remaining suite.
   doCheck = true;
+  nativeCheckInputs = [
+    curl
+    nodejs
+  ];
   preCheck = ''
     export HOME="$TMPDIR/hex-test-home"
     mkdir -p "$HOME"
+    node --test gnome/extension.test.cjs
   '';
 
   postInstall = ''
@@ -136,6 +149,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
     install -Dm644 ${../packaging/hex.desktop} $out/share/applications/hex.desktop
     substituteInPlace $out/share/applications/hex.desktop \
       --replace-fail '@HEX_BIN@' "$out/bin/hex"
+    mkdir -p $out/share/gnome-shell/extensions/hex@shekohex.dev
+    cp gnome/{metadata.json,interface.xml,extension.js} $out/share/gnome-shell/extensions/hex@shekohex.dev/
   '';
 
   preFixup = ''

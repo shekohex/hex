@@ -33,6 +33,7 @@ pub enum Request {
     CancelShortcut,
     SetTerminalPaste(bool),
     SetVolume(f32),
+    ConfigureProviders(Box<crate::linux_settings::ProviderConfiguration>),
     ChooseModel {
         model: TranscriptionModelId,
         language: String,
@@ -566,6 +567,8 @@ const SESSION_KEYS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_TYPE",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
 ];
 
 fn environment_line(key: &str, value: &str) -> Result<String> {

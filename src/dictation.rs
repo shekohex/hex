@@ -764,6 +764,20 @@ impl DictationCapture {
         self.recording.is_some()
     }
 
+    /// Intentional, normalized audio already available for a nonblocking upstream projection.
+    #[cfg(target_os = "linux")]
+    pub fn live_samples_from(&self, offset: usize) -> &[f32] {
+        let Some(recording) = self
+            .recording
+            .as_ref()
+            .filter(|recording| recording.intentional)
+        else {
+            return &[];
+        };
+        let delay = recording.resampler.as_ref().map_or(0, Fft::output_delay);
+        &recording.samples[(delay + offset).min(recording.samples.len())..]
+    }
+
     #[cfg(any(test, target_os = "linux"))]
     pub fn start(&mut self, now: CaptureInstant) {
         self.start_with_pre_roll(now, PRE_ROLL_DURATION, false);
@@ -990,6 +1004,40 @@ mod tests {
                     .zip(&whole)
                     .all(|(left, right)| (left - right).abs() < 1e-5),
                 "rate {rate}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_audio_is_an_exact_prefix_of_the_final_unpadded_clip() {
+        for sample_rate in [16_000, 44_100, 48_000] {
+            let mut capture = DictationCapture::new(sample_rate);
+            let started_at = capture_time();
+            capture.start(started_at);
+            let source = (0..sample_rate as usize + 777)
+                .map(|index| (index as f32 * 0.013).sin() * 0.4)
+                .collect::<Vec<_>>();
+            let mut live = Vec::new();
+            let mut consumed = 0;
+            let mut through = started_at;
+            for chunk in source.chunks(1337) {
+                consumed += chunk.len();
+                through =
+                    started_at + Duration::from_secs_f64(consumed as f64 / f64::from(sample_rate));
+                capture.ingest(chunk, through);
+                capture.become_intentional(through);
+                live.extend_from_slice(capture.live_samples_from(live.len()));
+            }
+            let Finish::Transcribe(clip) = capture.finish(through) else {
+                panic!("expected transcription");
+            };
+            let final_samples = clip.into_transcription_samples();
+            assert!(!live.is_empty());
+            assert!(final_samples.starts_with(&live), "{sample_rate} Hz");
+            assert_eq!(
+                final_samples.len(),
+                consumed * 16_000 / sample_rate as usize
             );
         }
     }

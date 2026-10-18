@@ -1,11 +1,18 @@
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TrySendError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use color_eyre::eyre::Result;
+#[cfg(target_os = "macos")]
+use color_eyre::eyre::WrapErr;
+#[cfg(any(test, target_os = "macos"))]
+use color_eyre::eyre::eyre;
 use url::Url;
 
 #[cfg(target_os = "macos")]

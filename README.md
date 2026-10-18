@@ -150,7 +150,9 @@ npx skills add anomalyco/hex --skill hex-personal-commands
 
 ## Privacy And Local Data
 
-- Speech transcription and command recognition run locally.
+- Speech transcription runs locally by default. Linux can explicitly opt into
+  cloud dictation and provider-backed cleanup in **Models & Processing**.
+  Command recognition stays local.
 - HEX does not save dictation audio by default.
 - On macOS, History retains successfully pasted dictation and Voice Action text
   for seven days by default, including the local transcript, final text, and
@@ -165,6 +167,9 @@ npx skills add anomalyco/hex --skill hex-personal-commands
   foreground application names, and Brave URLs. HEX does not upload these logs.
 - OpenCode features send the data described above to your configured model
   provider.
+- Linux cleanup sends the transcript plus only enabled context sources.
+  **Local OCR** sends extracted window text, not an image; **Screenshot** sends
+  the window image. Both are off by default.
 - Model installation and software updates require network access.
 
 Review and redact diagnostics before sharing them.
@@ -194,11 +199,14 @@ Diagnostics are stored at:
 
 ## Linux Beta
 
-The Linux beta targets x86_64 Linux on i3/X11 and compatible wlroots Wayland
-compositors. It supports local hotkey dictation, a GPUI settings shell, and
-signed updates for direct installs. Native Wayland requires explicit input-device
+The Linux beta targets x86_64 Linux on i3/X11, GNOME 49/50 Wayland with the
+bundled Shell extension, and compatible wlroots Wayland compositors.
+It supports local or OpenAI-compatible cloud hotkey dictation,
+per-application cleanup pipelines, a GPUI settings shell, and
+signed updates for direct installs. The wlroots path requires explicit input-device
 access and compositor support for clipboard, virtual-keyboard, and layer-shell
-protocols. Voice commands and meetings are not included.
+protocols. GNOME uses its own shortcut, paste, window-capture, and HUD adapter
+without raw-device access. Voice commands and meetings are not included.
 
 Use the [Linux installation guide](docs/linux.md) to build from source until
 the first signed Linux release is published. It also describes the planned

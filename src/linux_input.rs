@@ -54,9 +54,16 @@ pub(crate) const ESCAPE_CANCEL_WARNING: &str =
 #[derive(Clone, Debug, Default)]
 pub struct HotkeyStatus {
     escape_unavailable: Arc<AtomicBool>,
+    output_pending: Arc<AtomicBool>,
 }
 
 impl HotkeyStatus {
+    pub(crate) fn set_output_pending(&self, pending: bool) {
+        self.output_pending.store(pending, Ordering::Release);
+    }
+    pub(crate) fn output_pending(&self) -> bool {
+        self.output_pending.load(Ordering::Acquire)
+    }
     pub(crate) fn warning(&self) -> Option<String> {
         self.escape_unavailable
             .load(Ordering::Acquire)
@@ -99,11 +106,22 @@ impl LinuxHotkeyMonitor {
         let started = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker_started = started.clone();
-        let wayland_modifiers = session.is_wayland().then(WaylandModifierState::default);
+        let gnome = session.is_wayland() && crate::linux_gnome::is_gnome();
+        let wayland_modifiers = (session.is_wayland() && !gnome)
+            .then(|| WaylandModifierState::with_output_pending(status.output_pending.clone()));
         let worker_modifiers = wayland_modifiers.clone();
         let worker = thread::spawn(move || {
             let result = match session {
                 LinuxSession::X11 => run(
+                    events_sender,
+                    worker_stop,
+                    ready_sender.clone(),
+                    binding,
+                    double_tap_enabled,
+                    worker_started.clone(),
+                    status,
+                ),
+                LinuxSession::Wayland if gnome => crate::linux_gnome::run(
                     events_sender,
                     worker_stop,
                     ready_sender.clone(),
@@ -194,7 +212,21 @@ fn run(
     let mut last_release = None;
     let mut escape_grabbed = Vec::new();
     let mut pending_release: Option<Instant> = None;
+    let mut previous_output_pending = false;
     while !stop.load(Ordering::Acquire) {
+        let output_pending = status.output_pending.load(Ordering::Acquire);
+        if output_pending
+            && escape_grabbed.is_empty()
+            && (!previous_output_pending || !status.escape_unavailable.load(Ordering::Acquire))
+        {
+            escape_grabbed = grab_escape(&connection, root, escape, &escape_modifiers)?;
+            if status.update_escape_availability(!escape_grabbed.is_empty()) {
+                tracing::warn!("{ESCAPE_CANCEL_WARNING}; continuing without Escape-cancel");
+            }
+        } else if !output_pending && !active && !locked && !dirty {
+            release_escape(&connection, root, escape, &mut escape_grabbed)?;
+        }
+        previous_output_pending = output_pending;
         if let Some(released_at) = pending_release
             && released_at.elapsed() >= RELEASE_GRACE
         {
@@ -233,7 +265,9 @@ fn run(
                     second_tap = last_release
                         .take()
                         .is_some_and(|released: Instant| released.elapsed() < DOUBLE_TAP_WINDOW);
-                    escape_grabbed = grab_escape(&connection, root, escape, &escape_modifiers)?;
+                    if escape_grabbed.is_empty() {
+                        escape_grabbed = grab_escape(&connection, root, escape, &escape_modifiers)?;
+                    }
                     if status.update_escape_availability(!escape_grabbed.is_empty()) {
                         tracing::warn!("{ESCAPE_CANCEL_WARNING}; continuing without Escape-cancel");
                     }
@@ -253,7 +287,9 @@ fn run(
                 release_escape(&connection, root, escape, &mut escape_grabbed)?;
             }
             Event::KeyPress(event)
-                if event.detail == escape && !escape_grabbed.is_empty() && (active || locked) =>
+                if event.detail == escape
+                    && !escape_grabbed.is_empty()
+                    && (active || locked || output_pending) =>
             {
                 pending_release = None;
                 active = false;

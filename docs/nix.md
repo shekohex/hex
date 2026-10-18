@@ -1,11 +1,12 @@
 # Nix
 
 The flake packages HEX for `x86_64-linux`. It supports the Linux X11 beta
-and native Wayland on compatible wlroots compositors. Wayland requires
+and native Wayland on GNOME 49/50 with the HEX extension or compatible wlroots
+compositors. The wlroots backend requires
 layer-shell for the recording overlay, the clipboard protocol used by
 `wl-copy`, the virtual-keyboard protocol used by `wtype`, and read access to
 every `/dev/input/event*` device for global hotkeys. This is not a claim of support
-for every Wayland desktop; GNOME and KDE are not covered by this contract.
+for every Wayland desktop; KDE is not covered by this contract.
 
 ## Run Or Install
 
@@ -20,7 +21,8 @@ nix run . -- app
 Or add `hex.url = "github:anomalyco/hex"` to your configuration's flake inputs
 and install `hex.packages.x86_64-linux.default`. The package supplies the
 `hex` command and desktop launcher, native libraries, and the `curl`,
-`wl-copy`, and `wtype` runtime dependencies. Your system still needs a
+`wl-copy`, `wtype`, `grim`, `xclip`, and English Tesseract runtime dependencies.
+The GNOME extension ships in the same package. Your system still needs a
 working audio session and a Vulkan driver for Settings, even when inference
 falls back to the CPU. On non-NixOS hosts, Nix GUI
 applications may require the host's usual Nix graphics integration.
@@ -60,6 +62,8 @@ explicit `programs.hex.package` override. The flake also exports
   programs.hex = {
     enable = true;
     autostart = true;
+    # GNOME 49/50 only; installs and enables the bundled Shell adapter:
+    # gnomeIntegration = true;
     # Use your compositor's session target when appropriate:
     # systemdTarget = "sway-session.target";
   };
@@ -83,6 +87,12 @@ Sway integration, rather than starting the target from a shell login.
 The module does not create a graphical session or grant permission to use
 one. A bare `startx`/i3 session without systemd session integration will not
 start this service automatically.
+
+On GNOME, enable `gnomeIntegration` and log out/in after first installation.
+The Shell adapter requires no raw-input permissions, `wtype`, or layer-shell.
+Keep `autostart = false` for first-run shortcut/provider setup. See the
+[GNOME contract](linux.md#native-gnome-wayland). New source files must be tracked
+by Git (intent-to-add is sufficient) for local Git flake builds to include them.
 
 `hex start` records the current display/session environment in an owner-only
 file read by the unit; it clears stale variables when switching between X11 and

@@ -265,6 +265,7 @@ impl Profiles {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn process_voice_action_cancellable(
     instruction: &str,
     selected_text: Option<&str>,
@@ -725,7 +726,7 @@ fn generate(prompt: &str, model: Option<&Model>, deadline: Duration) -> Result<S
     generate_cancellable(prompt, model, deadline, &AtomicBool::new(false))
 }
 
-fn generate_cancellable(
+pub(crate) fn generate_cancellable(
     prompt: &str,
     model: Option<&Model>,
     deadline: Duration,
@@ -1034,7 +1035,11 @@ fn opencode_http_command(
         _ => return Err(eyre!("OpenCode service must use a loopback HTTP endpoint")),
     }
     url.set_path(path);
-    let mut command = Command::new("/usr/bin/curl");
+    let mut command = Command::new(if cfg!(target_os = "macos") {
+        "/usr/bin/curl"
+    } else {
+        "curl"
+    });
     let directory = if let Some(workspace) = workspace {
         fs::create_dir_all(workspace).wrap_err_with(|| {
             format!(
@@ -1478,7 +1483,14 @@ mod tests {
         )
         .unwrap();
         let workspace = root.canonicalize().unwrap();
-        assert_eq!(command.get_program(), OsStr::new("/usr/bin/curl"));
+        assert_eq!(
+            command.get_program(),
+            OsStr::new(if cfg!(target_os = "macos") {
+                "/usr/bin/curl"
+            } else {
+                "curl"
+            })
+        );
         assert_eq!(command.get_current_dir(), Some(workspace.as_path()));
         for arg in command.get_args() {
             assert!(!arg.to_string_lossy().contains("fixture-password"));
@@ -1834,7 +1846,7 @@ mod tests {
     fn mode_corrections_run_before_registered_transformations() {
         let profile = Profile::new("Global", "")
             .replacements(ReplacementSet::new(&[
-                crate::app_settings::TextReplacement {
+                crate::text_replacements::TextReplacement {
                     matched_phrase: "open code".into(),
                     output: "OpenCode".into(),
                 },
@@ -1855,7 +1867,7 @@ mod tests {
 
     #[test]
     fn cancelled_generation_process_is_killed_promptly() {
-        let mut command = Command::new("/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("5");
         let cancelled = AtomicBool::new(true);
         let started = Instant::now();
@@ -2345,7 +2357,7 @@ mod tests {
 
     #[test]
     fn blocked_request_pipe_does_not_outlive_the_deadline() {
-        let mut command = Command::new("/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("5");
         let started = Instant::now();
         let error = run_command(

@@ -32,6 +32,7 @@ pub struct LinuxPaster {
 enum Backend {
     X11(Box<X11Paster>),
     Wayland(WaylandModifierState),
+    Gnome,
 }
 
 impl LinuxPaster {
@@ -42,6 +43,7 @@ impl LinuxPaster {
     ) -> Result<Self> {
         let backend = match LinuxSession::detect() {
             LinuxSession::X11 => Backend::X11(Box::new(X11Paster::new()?)),
+            LinuxSession::Wayland if crate::linux_gnome::is_gnome() => Backend::Gnome,
             LinuxSession::Wayland => {
                 let modifiers = wayland_modifiers.ok_or_else(|| {
                     eyre!("Wayland paste requires the active hotkey modifier state")
@@ -56,24 +58,42 @@ impl LinuxPaster {
         })
     }
 
+    #[cfg(test)]
     pub fn paste(&mut self, text: &str) -> Result<()> {
+        self.paste_with_commit(text, &self.stop.clone(), || Ok(()))
+    }
+
+    /// Cancellation can win until the insertion commits, including modifier waits.
+    pub fn paste_with_commit(
+        &mut self,
+        text: &str,
+        cancelled: &AtomicBool,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(eyre!("Paste cancelled while stopping"));
+        }
         if text.trim().is_empty() {
             return Err(eyre!("refusing to paste an empty transcript"));
         }
         match &mut self.backend {
-            Backend::X11(paster) => paster.paste(text, &self.stop, self.paste_with_shift)?,
+            Backend::X11(paster) => paster.paste(text, cancelled, self.paste_with_shift, commit)?,
+            Backend::Gnome => {
+                crate::linux_gnome::paste(text, self.paste_with_shift, cancelled, commit)?
+            }
             Backend::Wayland(modifiers) => {
-                wait_for_modifiers(&self.stop, || Ok(modifiers.held()))?;
+                wait_for_modifiers(cancelled, || Ok(modifiers.held()))?;
                 let mut copy = Command::new("wl-copy");
                 copy.args(["--type", "text/plain;charset=utf-8"]);
-                run_helper(copy, text.as_bytes(), &self.stop, HELPER_TIMEOUT)
+                run_helper(copy, text.as_bytes(), cancelled, HELPER_TIMEOUT)
                     .wrap_err("could not own the Wayland clipboard; install wl-clipboard and check compositor support")?;
                 // wl-copy's parent exits only after the selection is installed.
                 // Never read a pipe inherited by its clipboard-serving daemon.
-                wait_for_modifiers(&self.stop, || Ok(modifiers.held()))?;
+                wait_for_modifiers(cancelled, || Ok(modifiers.held()))?;
+                commit()?;
                 let mut keys = Command::new("wtype");
                 keys.args(paste_keys(self.paste_with_shift));
-                run_helper(keys, &[], &self.stop, HELPER_TIMEOUT)
+                run_helper(keys, &[], cancelled, HELPER_TIMEOUT)
                     .wrap_err("could not send the Wayland paste shortcut; install wtype and use a compositor supporting virtual keyboards")?;
             }
         }
@@ -107,8 +127,15 @@ impl X11Paster {
         })
     }
 
-    fn paste(&mut self, text: &str, stop: &AtomicBool, paste_with_shift: bool) -> Result<()> {
+    fn paste(
+        &mut self,
+        text: &str,
+        stop: &AtomicBool,
+        paste_with_shift: bool,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.wait_for_modifier_release(stop)?;
+        commit()?;
         let atoms = &self.clipboard.getter.atoms;
         self.clipboard
             .store(atoms.clipboard, atoms.utf8_string, text.as_bytes())
