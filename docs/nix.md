@@ -32,8 +32,10 @@ Run `hex model install` once, then launch HEX as your normal desktop user.
 Do not run HEX as root.
 
 The Nix store is not HEX's user-local managed installation layout. In-app
-updates do not replace a Nix installation. Update the flake input and
-rebuild or switch your Nix/Home Manager configuration instead. Remove any
+update checks, downloads, and installation are disabled for Nix packages.
+Having Nix installed does not disable updates for a separate direct install.
+Update the flake input and rebuild or switch your Nix/Home Manager configuration
+instead. Remove any
 old source-install XDG autostart entry before enabling a second autostart
 mechanism; do not run two HEX listeners.
 
@@ -66,6 +68,16 @@ explicit `programs.hex.package` override. The flake also exports
     # gnomeIntegration = true;
     # Use your compositor's session target when appropriate:
     # systemdTarget = "sway-session.target";
+    initialSettings = {
+      dictation_hotkey = {
+        alt = false;
+        control = true;
+        super_key = true;
+        key = "space";
+      };
+      double_tap_lock = true;
+      sound_effect_volume = 0.25;
+    };
   };
 }
 ```
@@ -78,6 +90,21 @@ client. Closing Settings never stops the service, and there is no Linux tray.
 The service stops with the configured target and retries failed starts
 without a tight restart loop. `hex stop` leaves it stopped until
 the next session or an explicit `systemctl --user start hex.service`.
+
+`initialSettings` defaults to `{ }`. On the service's first start without
+`linux-settings.json`, supplied fields merge with fresh-install defaults, validate,
+and save to the private writable settings file. Existing settings always win;
+app edits survive restarts and Home Manager switches. Changing these Nix defaults
+later does not reset an existing installation. Invalid seeds block capture and
+surface a startup error rather than silently recording with different settings.
+
+All Linux runtime fields can be seeded: `dictation_hotkey`, `double_tap_lock`,
+`paste_with_shift`, `sound_effect_volume`, `transcription`, `cloud_transcription`,
+and `processing` (cleanup providers, instructions, per-app modes, context, and OCR).
+Their JSON shape matches `hex status`'s `settings` object. These values enter the
+public Nix store: credentials must remain environment variable names or private key-file
+paths, never literal API keys. Autostart and GNOME integration remain Nix-managed,
+not mutable runtime settings.
 
 Your session manager must import its current `DISPLAY`, `XAUTHORITY`,
 `WAYLAND_DISPLAY`, and `XDG_RUNTIME_DIR` values as applicable into the systemd

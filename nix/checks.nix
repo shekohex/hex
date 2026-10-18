@@ -22,6 +22,16 @@ let
     autostart = true;
   };
   manual = home { enable = true; };
+  seeded = home {
+    enable = true;
+    initialSettings = {
+      dictation_hotkey = {
+        alt = false;
+        super_key = true;
+      };
+      double_tap_lock = false;
+    };
+  };
   gnome = home {
     enable = true;
     gnomeIntegration = true;
@@ -84,7 +94,13 @@ in
     assert builtins.elem hex enabled.home.packages;
     assert !(builtins.elem hex disabled.home.packages);
     assert manual.systemd.user.services.hex.Install.WantedBy == [ ];
-    assert lib.hasInfix "hex@shekohex.dev" (toString gnome.dconf.settings."org/gnome/shell".enabled-extensions);
+    assert
+      !(lib.any (lib.hasPrefix "HEX_INITIAL_SETTINGS_FILE=") manual.systemd.user.services.hex.Service.Environment);
+    assert lib.any (lib.hasPrefix "HEX_INITIAL_SETTINGS_FILE=")
+      seeded.systemd.user.services.hex.Service.Environment;
+    assert lib.hasInfix "hex@shekohex.dev" (
+      toString gnome.dconf.settings."org/gnome/shell".enabled-extensions
+    );
     assert
       gnome.xdg.dataFile."gnome-shell/extensions/hex@shekohex.dev".source
       == "${hex}/share/gnome-shell/extensions/hex@shekohex.dev";
@@ -101,6 +117,17 @@ in
     assert custom.systemd.user.services.hex.Install.WantedBy == [ "sway-session.target" ];
     pkgs.runCommand "hex-module-check" { } ''
       bash -n ${enabled.systemd.user.services.hex.Service.ExecStartPre}
+      seed=${
+        lib.escapeShellArg (
+          lib.removePrefix "HEX_INITIAL_SETTINGS_FILE=" (
+            lib.findFirst (lib.hasPrefix "HEX_INITIAL_SETTINGS_FILE=") ""
+              seeded.systemd.user.services.hex.Service.Environment
+          )
+        )
+      }
+      ${pkgs.python3}/bin/python -c \
+        'import json, sys; data = json.load(open(sys.argv[1])); assert data["dictation_hotkey"] == {"alt": False, "super_key": True}; assert data["double_tap_lock"] is False' \
+        "$seed"
       touch "$out"
     '';
 

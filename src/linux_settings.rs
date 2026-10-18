@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
@@ -91,10 +91,48 @@ impl LinuxSettings {
     pub fn load() -> Result<Self> {
         let path = settings_path()?;
         if !path.exists() {
-            return Ok(Self::default());
+            let Some(seed_path) = std::env::var_os("HEX_INITIAL_SETTINGS_FILE") else {
+                return Ok(Self::default());
+            };
+            let mut seed = Vec::new();
+            File::open(&seed_path)?
+                .take(112 * 1024 + 1)
+                .read_to_end(&mut seed)?;
+            if seed.len() > 112 * 1024 {
+                return Err(eyre!("Initial Linux settings exceed 112 KiB"));
+            }
+            let settings = Self::from_initial_settings(&seed)?;
+            settings.save()?;
+            return Ok(settings);
         }
         let settings: Self = serde_json::from_slice(&fs::read(&path)?)
             .wrap_err_with(|| format!("could not parse {}", path.display()))?;
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    fn from_initial_settings(seed: &[u8]) -> Result<Self> {
+        fn merge(defaults: &mut serde_json::Value, seed: serde_json::Value) {
+            match (defaults, seed) {
+                (serde_json::Value::Object(defaults), serde_json::Value::Object(seed)) => {
+                    for (key, value) in seed {
+                        merge(
+                            defaults.entry(key).or_insert(serde_json::Value::Null),
+                            value,
+                        );
+                    }
+                }
+                (defaults, seed) => *defaults = seed,
+            }
+        }
+
+        let seed: serde_json::Value = serde_json::from_slice(seed)?;
+        if !seed.is_object() {
+            return Err(eyre!("Initial Linux settings must be a JSON object"));
+        }
+        let mut defaults = serde_json::to_value(Self::default())?;
+        merge(&mut defaults, seed);
+        let settings: Self = serde_json::from_value(defaults)?;
         settings.validate()?;
         Ok(settings)
     }
@@ -201,6 +239,39 @@ fn settings_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_settings_merge_nested_fields_with_fresh_defaults() {
+        let settings = LinuxSettings::from_initial_settings(
+            br#"{"dictation_hotkey":{"alt":false,"super_key":true},"double_tap_lock":false}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.dictation_hotkey.label(), "Super+Space");
+        assert!(!settings.double_tap_lock);
+        assert!(!settings.paste_with_shift);
+        assert_eq!(settings.sound_effect_volume, 0.5);
+        assert_eq!(
+            LinuxSettings::from_initial_settings(b"{}").unwrap(),
+            LinuxSettings::default()
+        );
+    }
+
+    #[test]
+    fn invalid_initial_settings_are_rejected() {
+        for seed in [
+            "null",
+            "[]",
+            "{",
+            r#"{"sound_effect_volume":2}"#,
+            r#"{"dictation_hotkey":{"key":""}}"#,
+            r#"{"processing":{"default_mode":{"deadline_seconds":0}}}"#,
+        ] {
+            assert!(
+                LinuxSettings::from_initial_settings(seed.as_bytes()).is_err(),
+                "{seed}"
+            );
+        }
+    }
 
     #[test]
     fn default_binding_is_alt_space() {

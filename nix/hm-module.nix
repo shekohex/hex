@@ -6,6 +6,8 @@
 }:
 let
   cfg = config.programs.hex;
+  jsonFormat = pkgs.formats.json { };
+  initialSettingsFile = jsonFormat.generate "hex-initial-settings.json" cfg.initialSettings;
   waitForSession = pkgs.writeShellApplication {
     name = "hex-wait-for-session";
     runtimeInputs = [
@@ -25,6 +27,25 @@ in
     };
     autostart = lib.mkEnableOption "HEX startup with the graphical session";
     gnomeIntegration = lib.mkEnableOption "the HEX GNOME Shell integration (GNOME 49/50)";
+    initialSettings = lib.mkOption {
+      type = lib.types.attrsOf jsonFormat.type;
+      default = { };
+      example = {
+        dictation_hotkey = {
+          alt = false;
+          super_key = true;
+          key = "space";
+        };
+        sound_effect_volume = 0.25;
+      };
+      description = ''
+        Initial Linux runtime settings, merged with fresh-install defaults and
+        saved only when linux-settings.json does not exist. Later app edits and
+        existing settings take precedence, including after Home Manager switches.
+        Use environment variable names or private key-file paths for credentials;
+        these defaults are public in the Nix store.
+      '';
+    };
     systemdTarget = lib.mkOption {
       type = lib.types.str;
       default = "graphical-session.target";
@@ -61,7 +82,10 @@ in
       Service = {
         ExecStartPre = lib.getExe waitForSession;
         ExecStart = "${lib.getExe cfg.package} service";
-        Environment = [ "HEX_APPLICATION_SUPPORT_DIR=${config.xdg.dataHome}/voice-control" ];
+        Environment = [
+          "HEX_APPLICATION_SUPPORT_DIR=${config.xdg.dataHome}/voice-control"
+        ]
+        ++ lib.optional (cfg.initialSettings != { }) "HEX_INITIAL_SETTINGS_FILE=${initialSettingsFile}";
         EnvironmentFile = "-${config.xdg.dataHome}/voice-control/session.env";
         TimeoutStartSec = 35;
         Restart = "on-failure";

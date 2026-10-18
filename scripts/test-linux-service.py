@@ -29,7 +29,11 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
     support = root / "data"
     alsa = root / "alsa.conf"
     alsa.write_text("# No physical audio devices in this test.\n")
-    env = os.environ | {"HEX_APPLICATION_SUPPORT_DIR": str(support), "ALSA_CONFIG_PATH": str(alsa)}
+    seed = root / "initial-settings.json"
+    seed.write_text(json.dumps({"dictation_hotkey": {"key": "f12"},
+                                "double_tap_lock": False, "sound_effect_volume": 0.25}))
+    env = os.environ | {"HEX_APPLICATION_SUPPORT_DIR": str(support), "ALSA_CONFIG_PATH": str(alsa),
+                        "HEX_INITIAL_SETTINGS_FILE": str(seed)}
     env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
     path = support / "service.sock"
@@ -74,6 +78,14 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert state["pid"] == service.pid
         assert state["desktop"]["listener"]["status"] == "Model required"
         assert state["desktop"]["listener"]["warning"] is None
+        assert state["desktop"]["update_status"] == "Unavailable"
+        assert state["settings"]["dictation_hotkey"]["key"] == "f12"
+        assert state["settings"]["dictation_hotkey"]["alt"] is True
+        assert state["settings"]["double_tap_lock"] is False
+        assert state["settings"]["paste_with_shift"] is False
+        assert state["settings"]["sound_effect_volume"] == 0.25
+        assert json.loads((support / "linux-settings.json").read_text()) == state["settings"]
+        assert stat.S_IMODE((support / "linux-settings.json").stat().st_mode) == 0o600
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert stat.S_IMODE(support.stat().st_mode) == 0o700
 
@@ -141,10 +153,14 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         service.kill()
         service.wait(timeout=5)
         assert subprocess.run([binary, "status"], env=env, capture_output=True).returncode != 0
+        # Nix defaults seed once: even a missing seed cannot override app changes.
+        seed.unlink()
         service = launch()
         state = wait_for(snapshot)
         assert state["pid"] == service.pid
         assert state["settings"]["sound_effect_volume"] == 0
+        assert state["settings"]["dictation_hotkey"]["key"] == "f12"
+        assert state["settings"]["double_tap_lock"] is False
         assert state["settings"]["cloud_transcription"]["mode"] == "realtime"
         assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
         assert state["settings"]["processing"]["default_mode"]["context"]["screen"] == "ocr"

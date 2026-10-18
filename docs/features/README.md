@@ -708,6 +708,26 @@ a published, supported-host-validated signed release. [Nix](../nix.md) owns its
 package updates; HEX updates only managed direct installs.
 
 ```ts
+Home Manager                             // settings.linux-nix
+├── autostart / gnomeIntegration -> Nix-managed session integration
+├── initialSettings -> Missing linux-settings.json -> Merge defaults -> Validate -> Save privately
+│   └── Existing settings -> Ignore seed; preserve app edits across rebuilds
+└── Nix package -> No in-app update checks/downloads; update flake + rebuild
+```
+
+The seed can configure shortcuts, volume, model/provider selection, cleanup
+instructions, per-app modes, and context. No plaintext credentials belong in the
+Nix store. Invalid seeds block capture through the existing startup-settings
+error path. Sources: [Linux settings](../../src/linux_settings.rs),
+[Home Manager module](../../nix/hm-module.nix), and [Nix guide](../nix.md).
+Checks: `initial_settings_merge_nested_fields_with_fresh_defaults`,
+`invalid_initial_settings_are_rejected`, [module checks](../../nix/checks.nix),
+and [service smoke](../../scripts/test-linux-service.py) cover seeding,
+private persistence, app edits surviving a missing seed on restart, and
+unavailable updates in unmanaged/package layouts. These do not exercise an
+activated Home Manager session or physical shortcut capture.
+
+```ts
 Linux runtime                            // maintain.linux-service
 ├── hex start / desktop autostart -> systemd --user hex.service; no Settings or tray
 ├── Settings / CLI -> Same-user, owner-only Unix socket -> Typed commands and snapshots
