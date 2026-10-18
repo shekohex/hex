@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, bail, eyre};
 use serde::{Deserialize, Serialize};
 
-use crate::cloud::{ConnectionSettings, GenerationProtocol, GenerationSettings};
+use crate::cloud::{ConnectionSettings, GenerationProtocol, GenerationSettings, Thinking};
 use crate::linux_context::{CaptureContext, ContextSettings, ScreenContextMode};
 use crate::text_replacements::ReplacementSet;
 
@@ -56,6 +56,7 @@ pub struct PipelineMode {
     pub backend: CleanupBackend,
     pub connection: ConnectionSettings,
     pub model: String,
+    pub thinking: Thinking,
     pub prompt: String,
     pub stream: bool,
     pub deadline_seconds: u64,
@@ -72,6 +73,7 @@ impl Default for PipelineMode {
             backend: CleanupBackend::OpenCode,
             connection: ConnectionSettings::default(),
             model: String::new(),
+            thinking: Thinking::Default,
             prompt: PROGRAMMING_CLEANUP_PROMPT.into(),
             stream: false,
             deadline_seconds: 30,
@@ -110,6 +112,9 @@ impl PipelineSettings {
                 continue;
             }
             if mode.backend == CleanupBackend::OpenCode {
+                if mode.thinking != Thinking::Default {
+                    bail!("OpenCode manages its own thinking variants; use Default thinking");
+                }
                 if mode.context.screen == ScreenContextMode::Screenshot {
                     bail!("Window images require Chat Completions, Responses, or Gemini cleanup");
                 }
@@ -220,6 +225,14 @@ impl PipelineSettings {
 }
 
 impl PipelineMode {
+    pub fn thinking_options(&self, model: &str) -> &'static [Thinking] {
+        if self.backend == CleanupBackend::OpenCode {
+            &[Thinking::Default]
+        } else {
+            Thinking::options(self.generation_settings().protocol, model)
+        }
+    }
+
     fn generation_settings(&self) -> GenerationSettings {
         GenerationSettings {
             connection: self.connection.clone(),
@@ -229,6 +242,7 @@ impl PipelineMode {
                 _ => GenerationProtocol::ChatCompletions,
             },
             model: self.model.clone(),
+            thinking: self.thinking,
             stream: self.stream,
             deadline_seconds: self.deadline_seconds,
         }
@@ -255,6 +269,32 @@ fn opencode_model(model: &str) -> Result<Option<crate::dictation_processor::Mode
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_settings_preserve_legacy_defaults_and_round_trip_per_mode() {
+        let mut settings: PipelineSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.default_mode.thinking, Thinking::Default);
+        settings.default_mode.thinking = Thinking::Low;
+        settings.modes.push(PipelineMode {
+            thinking: Thinking::Budget(2048),
+            ..Default::default()
+        });
+        let restored: PipelineSettings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+        assert_eq!(
+            restored.default_mode.generation_settings().thinking,
+            Thinking::Low
+        );
+        assert_eq!(
+            restored.modes[0].generation_settings().thinking,
+            Thinking::Budget(2048)
+        );
+        let mut legacy: PipelineMode = serde_json::from_str(r#"{"model":"cleanup"}"#).unwrap();
+        assert_eq!(legacy.thinking_options("cleanup"), &[Thinking::Default]);
+        legacy.backend = CleanupBackend::Responses;
+        assert!(legacy.thinking_options("cleanup").contains(&Thinking::Max));
+    }
 
     #[test]
     fn contextual_modes_replace_global_processing_without_layering() {

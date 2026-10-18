@@ -178,6 +178,169 @@ fn file_streaming_uses_final_transcript_without_waiting_for_eof() {
 }
 
 #[test]
+fn thinking_controls_use_native_wire_fields_and_keep_default_requests_unchanged() {
+    for protocol in [
+        GenerationProtocol::ChatCompletions,
+        GenerationProtocol::Responses,
+        GenerationProtocol::Gemini,
+    ] {
+        let settings = GenerationSettings {
+            protocol,
+            model: "cleanup".into(),
+            ..Default::default()
+        };
+        let (_, body) = generation_request(&settings, "instructions", "text", None);
+        for key in ["reasoning_effort", "reasoning", "generationConfig"] {
+            assert!(body.get(key).is_none());
+        }
+    }
+
+    for (protocol, model, thinking, field, expected) in [
+        (
+            GenerationProtocol::ChatCompletions,
+            "cleanup",
+            Thinking::Off,
+            "/reasoning_effort",
+            json!("none"),
+        ),
+        (
+            GenerationProtocol::Responses,
+            "cleanup",
+            Thinking::XHigh,
+            "/reasoning/effort",
+            json!("xhigh"),
+        ),
+        (
+            GenerationProtocol::Responses,
+            "cleanup",
+            Thinking::Max,
+            "/reasoning/effort",
+            json!("max"),
+        ),
+        (
+            GenerationProtocol::Gemini,
+            "gemini-flash-latest",
+            Thinking::Low,
+            "/generationConfig/thinkingConfig",
+            json!({"thinkingLevel":"low"}),
+        ),
+        (
+            GenerationProtocol::Gemini,
+            "models/gemini-2.5-flash",
+            Thinking::Off,
+            "/generationConfig/thinkingConfig",
+            json!({"thinkingBudget":0}),
+        ),
+        (
+            GenerationProtocol::Gemini,
+            "gemini-2.5-pro",
+            Thinking::Budget(1024),
+            "/generationConfig/thinkingConfig",
+            json!({"thinkingBudget":1024}),
+        ),
+    ] {
+        for streaming in [false, true] {
+            let response = match protocol {
+                GenerationProtocol::ChatCompletions => {
+                    json!({"choices":[{"finish_reason":"stop","message":{"content":"Clean."},"delta":{"content":"Clean."}}]})
+                }
+                GenerationProtocol::Responses => {
+                    json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Clean."}]}]})
+                }
+                GenerationProtocol::Gemini => {
+                    json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"Clean."}]}}]})
+                }
+            };
+            let payload = if !streaming {
+                response.to_string()
+            } else if protocol == GenerationProtocol::Responses {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":response})
+                )
+            } else {
+                format!("data: {response}\n\ndata: [DONE]\n\n")
+            };
+            let (connection, request, worker) = server(payload, streaming);
+            let settings = GenerationSettings {
+                connection,
+                protocol,
+                model: model.into(),
+                thinking,
+                stream: streaming,
+                ..Default::default()
+            };
+            assert_eq!(
+                generate(
+                    &settings,
+                    "instructions",
+                    "text",
+                    None,
+                    &AtomicBool::new(false)
+                )
+                .unwrap(),
+                "Clean."
+            );
+            let body: Value = serde_json::from_slice(&request.recv().unwrap().body).unwrap();
+            assert_eq!(body.pointer(field), Some(&expected));
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn thinking_choices_reject_incompatible_gemini_levels_and_budgets() {
+    for (model, thinking) in [
+        ("gemini-2.5-flash", Thinking::Low),
+        ("gemini-2.5-flash", Thinking::Budget(24577)),
+        ("gemini-2.5-flash-lite", Thinking::Budget(511)),
+        ("gemini-2.5-pro", Thinking::Off),
+        ("gemini-2.5-pro", Thinking::Budget(127)),
+        ("gemini-3-flash", Thinking::Off),
+        ("gemini-3-flash", Thinking::Max),
+        ("gemini-3-flash", Thinking::Budget(1024)),
+        ("gemini-3.8-flash", Thinking::Minimal),
+        ("gemini-3.1-pro-preview", Thinking::Medium),
+    ] {
+        assert!(
+            thinking
+                .validate(GenerationProtocol::Gemini, model)
+                .is_err(),
+            "{model}: {thinking:?}"
+        );
+    }
+    assert!(
+        Thinking::Budget(1024)
+            .validate(GenerationProtocol::Responses, "cleanup")
+            .is_err()
+    );
+    for (thinking, expected) in [
+        (Thinking::Off, "none"),
+        (Thinking::Minimal, "minimal"),
+        (Thinking::Low, "low"),
+        (Thinking::Medium, "medium"),
+        (Thinking::High, "high"),
+        (Thinking::XHigh, "xhigh"),
+        (Thinking::Max, "max"),
+    ] {
+        assert!(
+            thinking
+                .validate(GenerationProtocol::ChatCompletions, "gateway-model")
+                .is_ok()
+        );
+        let settings = GenerationSettings {
+            model: "gateway-model".into(),
+            thinking,
+            ..Default::default()
+        };
+        assert_eq!(
+            generation_request(&settings, "", "", None).1["reasoning_effort"],
+            expected
+        );
+    }
+}
+
+#[test]
 fn cleanup_protocols_send_instructions_text_and_images_in_native_formats() {
     for (protocol, route, response) in [
         (

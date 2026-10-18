@@ -623,6 +623,8 @@ Linux Settings > Models & Processing      // dictate.providers.linux
 Processing Modes                         // modes.providers.linux
 ├── Application match -> Mode replaces Global
 ├── Corrections -> Optional OpenCode / Chat / Responses / Gemini cleanup
+├── Direct API thinking -> Per-mode provider/model choices; Default omits parameters
+│   └── Gemini 2.5 -> Native token budget; Off only where supported
 └── Editable instructions + model + deadline -> Ordered final paste
     └── Failed / empty / incomplete cleanup -> Corrected transcript
 
@@ -661,6 +663,27 @@ synthetic pixels only. These are not live provider, physical capture/paste,
 desktop Accessibility, or screen-OCR-quality proof. OpenCode accepts OCR text,
 not image upload. Wayland needs compatible screenshot support and focused-window
 geometry; captured rectangles may include overlapping content.
+
+Thinking presets persist per mode and survive restart; older settings retain
+provider defaults. Chat and Responses expose Off through Max; native Gemini uses
+levels or 2.5 token budgets, never an invented Off-to-Minimal mapping. Changing
+backend resets thinking to Default. OpenCode remains unchanged. Known invalid
+Gemini combinations are rejected; aliases/gateways still require model support.
+Wire, compatibility, and persistence regressions are in [cloud tests](../../src/cloud/tests.rs)
+and [pipeline tests](../../src/linux_pipeline.rs). They cover streaming and ordinary
+requests, omitted defaults, native fields, and invalid budgets, not live-provider
+acceptance or native interaction with the new controls.
+
+**Executed October 18, 2026, thinking controls:** 257 Rust tests passed in debug
+and the Nix release package (13 ignored), strict all-target Clippy and formatting
+passed, and all 7 GNOME adapter checks passed. Isolated service IPC checked
+legacy defaults, saved thinking, invalid-provider rejection without mutation,
+and preservation after restart. No live-provider thinking override was sent.
+
+**Observed October 18, 2026, installed Nix/GNOME Wayland build `d4693e2`:** user
+confirmed realtime dictation inserts text. Last four successful outputs recorded
+2.866–5.728 seconds in Gemini cleanup, without fallback. This establishes the
+configured gateway's dictation/paste path, not every provider or new thinking choice.
 
 **Executed October 18, 2026, Linux working tree:** 249 Rust tests passed,
 13 opt-in tests ignored. The synthetic Tesseract fixture passed separately.

@@ -211,6 +211,32 @@ class on Hyprland, app_id/class on Sway, or application names exposed by AT-SPI.
 Modes replace Global rather than layering. JSON `replacements` entries support
 `matched_phrase` and `output`. Cleanup failure preserves corrected transcription.
 
+### Thinking
+
+Each direct-API processing mode has a **Thinking** control beside its model.
+**Default** omits reasoning parameters, preserving provider behavior and older
+settings. Changing the cleanup backend resets thinking to Default; Save applies it.
+
+- **Chat / Responses:** Default, Off, Minimal, Low, Medium, High, X-high, Max.
+  Off sends `none`; the other presets send their API effort names. Chat uses
+  `reasoning_effort`, Responses uses `reasoning.effort`.
+- **Gemini:** native `generationConfig.thinkingConfig.thinkingLevel` choices,
+  with known model restrictions. Gemini 3/4 do not offer Off. Minimal is not a
+  guarantee of no reasoning; newer 3.8/4 models omit Minimal.
+- **Gemini 2.5:** Default or Token budget; Flash also offers Off (budget 0).
+  Explicit budgets are 1–24,576 for Flash, 512–24,576 for Flash-Lite,
+  and 128–32,768 for Pro. No invented low/medium/high-to-token mapping.
+- **OpenCode:** unchanged; its own model/variant selection manages reasoning.
+
+Aliases and compatible gateways can support fewer levels than their protocol;
+the selected model must accept the requested setting. Invalid known combinations
+are rejected on Save. Provider rejection keeps the corrected transcript, following
+normal cleanup fallback; HEX never silently substitutes another thinking level.
+JSON presets use `thinking: "low"`, `"off"`, `"x_high"`, etc.; a Gemini 2.5 budget
+uses `thinking: { "budget": 1024 }`.
+See [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning)
+and [Gemini thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
+
 ### Credentials
 
 Keys never enter settings or IPC snapshots. Configure an environment-variable

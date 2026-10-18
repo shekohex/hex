@@ -84,6 +84,7 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert state["settings"]["double_tap_lock"] is False
         assert state["settings"]["paste_with_shift"] is False
         assert state["settings"]["sound_effect_volume"] == 0.25
+        assert state["settings"]["processing"]["default_mode"]["thinking"] == "default"
         assert json.loads((support / "linux-settings.json").read_text()) == state["settings"]
         assert stat.S_IMODE((support / "linux-settings.json").stat().st_mode) == 0o600
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -109,6 +110,7 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
             },
             "processing": {"default_mode": {
                 "enabled": True, "backend": "responses", "model": "fixture-cleanup",
+                "thinking": "low",
                 "prompt": "Keep my custom instructions. Preserve العربية.",
                 "context": {"screen": "ocr", "ocr_languages": "eng"},
             }},
@@ -118,11 +120,17 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         state = wait_for(lambda: (s := snapshot()) and not s["editing"]
                          and s["settings"]["cloud_transcription"] and s)
         assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
+        assert json.loads((support / "linux-settings.json").read_text())["processing"]["default_mode"]["thinking"] == "low"
         assert state["settings"]["sound_effect_volume"] == 0
         assert stat.S_IMODE((support / "linux-settings.json").stat().st_mode) == 0o600
         invalid = providers | {"cloud_transcription": providers["cloud_transcription"] | {"model": ""}}
         with connection() as client:
             assert call(client, {"ConfigureProviders": invalid})["error"]
+        assert snapshot()["settings"] == state["settings"]
+        invalid_thinking = providers | {"processing": {"default_mode":
+            providers["processing"]["default_mode"] | {"backend": "gemini", "thinking": "max"}}}
+        with connection() as client:
+            assert call(client, {"ConfigureProviders": invalid_thinking})["error"]
         assert snapshot()["settings"] == state["settings"]
 
         # Disconnecting an uncommitted focused shortcut capture releases only that edit.
@@ -164,6 +172,7 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert state["settings"]["cloud_transcription"]["mode"] == "realtime"
         assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
         assert state["settings"]["processing"]["default_mode"]["context"]["screen"] == "ocr"
+        assert state["settings"]["processing"]["default_mode"]["thinking"] == "low"
         subprocess.run([binary, "stop"], env=env, check=True, capture_output=True)
         assert service.wait(timeout=8) == 0
         assert not path.exists()

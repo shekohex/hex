@@ -2,6 +2,7 @@
 mod realtime;
 #[cfg(test)]
 mod tests;
+mod thinking;
 
 use std::future::Future;
 use std::io::{Cursor, Read};
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 pub use realtime::RealtimeSession;
+pub use thinking::Thinking;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
@@ -172,6 +174,7 @@ pub struct GenerationSettings {
     pub connection: ConnectionSettings,
     pub protocol: GenerationProtocol,
     pub model: String,
+    pub thinking: Thinking,
     pub stream: bool,
     pub deadline_seconds: u64,
 }
@@ -182,6 +185,7 @@ impl Default for GenerationSettings {
             connection: ConnectionSettings::default(),
             protocol: GenerationProtocol::ChatCompletions,
             model: String::new(),
+            thinking: Thinking::Default,
             stream: false,
             deadline_seconds: 30,
         }
@@ -191,7 +195,8 @@ impl Default for GenerationSettings {
 impl GenerationSettings {
     pub fn validate(&self) -> Result<()> {
         self.connection.validate()?;
-        validate_model(&self.model, self.deadline_seconds)
+        validate_model(&self.model, self.deadline_seconds)?;
+        self.thinking.validate(self.protocol, &self.model)
     }
 }
 
@@ -413,7 +418,7 @@ fn generation_request(
     let image_url = image
         .zip(image_data.as_ref())
         .map(|(image, data)| format!("data:{};base64,{data}", image.mime_type));
-    match settings.protocol {
+    let (route, mut body) = match settings.protocol {
         GenerationProtocol::ChatCompletions => {
             let mut content = vec![json!({"type": "text", "text": input})];
             if let Some(url) = image_url {
@@ -466,7 +471,22 @@ fn generation_request(
                 }),
             )
         }
+    };
+    if settings.thinking != Thinking::Default {
+        match settings.protocol {
+            GenerationProtocol::ChatCompletions => {
+                body["reasoning_effort"] = json!(settings.thinking.effort());
+            }
+            GenerationProtocol::Responses => {
+                body["reasoning"] = json!({"effort": settings.thinking.effort()});
+            }
+            GenerationProtocol::Gemini => {
+                body["generationConfig"] =
+                    json!({"thinkingConfig": settings.thinking.gemini_config()});
+            }
+        }
     }
+    (route, body)
 }
 
 fn nonempty(text: String) -> Result<String> {

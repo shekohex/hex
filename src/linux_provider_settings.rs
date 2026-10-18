@@ -1,6 +1,6 @@
 use gpui::{AnyElement, App, Context, Entity, EventEmitter, Render, Window, div, prelude::*, px};
 
-use crate::cloud::{ConnectionSettings, TranscriptionMode, TranscriptionSettings};
+use crate::cloud::{ConnectionSettings, Thinking, TranscriptionMode, TranscriptionSettings};
 use crate::desktop_ui::{
     error_message, header_button, pane_body, pane_content, pane_header_with_action,
     segmented_control, segmented_item, settings_panel, settings_row, settings_section_label,
@@ -68,12 +68,19 @@ struct ModeInputs {
     applications: Entity<TextInput>,
     model: Entity<TextInput>,
     instructions: Entity<TextInput>,
+    thinking_budget: Entity<TextInput>,
+    _model_subscription: gpui::Subscription,
     deadline: Entity<TextInput>,
     ocr_languages: Entity<TextInput>,
 }
 
 impl ModeInputs {
     fn new(mode: &PipelineMode, cx: &mut Context<ProviderEditor>) -> Self {
+        let model = input("Model ID; OpenCode may use Automatic", &mode.model, cx);
+        let model_subscription =
+            cx.subscribe(&model, |_, _, _: &crate::text_input::Changed, cx| {
+                cx.notify();
+            });
         Self {
             connection: ConnectionInputs::new(&mode.connection, cx),
             name: input("Mode name", &mode.name, cx),
@@ -82,7 +89,17 @@ impl ModeInputs {
                 &mode.applications.join(", "),
                 cx,
             ),
-            model: input("Model ID; OpenCode may use Automatic", &mode.model, cx),
+            model,
+            thinking_budget: input(
+                "Thinking tokens",
+                &match mode.thinking {
+                    Thinking::Budget(tokens) => tokens,
+                    _ => 1024,
+                }
+                .to_string(),
+                cx,
+            ),
+            _model_subscription: model_subscription,
             instructions: cx
                 .new(|cx| TextInput::multiline(cx, "Cleanup instructions", &mode.prompt)),
             deadline: input("Seconds", &mode.deadline_seconds.to_string(), cx),
@@ -205,6 +222,21 @@ impl ProviderEditor {
             .parse::<u64>()
             .map_err(|_| color_eyre::eyre::eyre!("Cleanup deadline must be a number of seconds"))?;
         let connection = self.mode_inputs.connection.read(cx);
+        let thinking = if matches!(self.mode().thinking, Thinking::Budget(_)) {
+            Thinking::Budget(
+                self.mode_inputs
+                    .thinking_budget
+                    .read(cx)
+                    .text()
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| {
+                        color_eyre::eyre::eyre!("Thinking budget must be a token count")
+                    })?,
+            )
+        } else {
+            self.mode().thinking
+        };
         let ocr_languages = self
             .mode_inputs
             .ocr_languages
@@ -216,6 +248,7 @@ impl ProviderEditor {
         mode.name = name;
         mode.applications = applications;
         mode.model = model;
+        mode.thinking = thinking;
         mode.prompt = prompt;
         mode.deadline_seconds = deadline;
         mode.connection = connection;
@@ -406,6 +439,9 @@ impl Render for ProviderEditor {
                             return;
                         }
                         let mode = this.mode_mut();
+                        if mode.backend != backend {
+                            mode.thinking = Thinking::Default;
+                        }
                         mode.backend = backend;
                         if backend == CleanupBackend::Gemini
                             && mode.connection.base_url == ConnectionSettings::default().base_url
@@ -429,6 +465,30 @@ impl Render for ProviderEditor {
         let clipboard = self.mode().context.clipboard;
         let active_field = self.mode().context.active_field;
         let screen_context = self.mode().context.screen;
+        let thinking = self.mode().thinking;
+        let thinking_choices = self
+            .mode()
+            .thinking_options(self.mode_inputs.model.read(cx).text());
+        let thinking_control = div().w(px(330.0)).flex().flex_wrap().gap_2().children(
+            thinking_choices
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, choice)| {
+                    let selected = choice == thinking
+                        || matches!(
+                            (choice, thinking),
+                            (Thinking::Budget(_), Thinking::Budget(_))
+                        );
+                    header_button(choice.label())
+                        .id(("cleanup-thinking", index))
+                        .when(!selected, |button| button.opacity(0.6))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mode_mut().thinking = choice;
+                            cx.notify();
+                        }))
+                }),
+        );
         let cleanup = settings_panel()
             .child(
                 settings_row(
@@ -452,6 +512,17 @@ impl Render for ProviderEditor {
                 panel.children(self.mode_inputs.connection.render())
             })
             .child(field("Model ID", &self.mode_inputs.model))
+            .when(selected_backend != CleanupBackend::OpenCode, |panel| {
+                panel
+                    .child(settings_row(
+                        "Thinking",
+                        "Default uses provider settings; model support varies",
+                        thinking_control,
+                    ))
+                    .when(matches!(thinking, Thinking::Budget(_)), |panel| {
+                        panel.child(field("Thinking tokens", &self.mode_inputs.thinking_budget))
+                    })
+            })
             .child(field("Deadline (seconds)", &self.mode_inputs.deadline))
             .when(selected_backend != CleanupBackend::OpenCode, |panel| {
                 panel.child(
