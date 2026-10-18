@@ -133,6 +133,7 @@ pub struct TranscriptionSettings {
     pub prompt: String,
     pub mode: TranscriptionMode,
     pub deadline_seconds: u64,
+    pub max_retries: u8,
 }
 
 impl Default for TranscriptionSettings {
@@ -144,6 +145,7 @@ impl Default for TranscriptionSettings {
             prompt: String::new(),
             mode: TranscriptionMode::Batch,
             deadline_seconds: 120,
+            max_retries: 2,
         }
     }
 }
@@ -152,6 +154,9 @@ impl TranscriptionSettings {
     pub fn validate(&self) -> Result<()> {
         self.connection.validate()?;
         validate_model(&self.model, self.deadline_seconds)?;
+        if self.max_retries > 10 {
+            bail!("Realtime retries must be between 0 and 10");
+        }
         if self.language.len() > 32 || self.prompt.len() > 16 * 1024 {
             bail!("Transcription language or recognition prompt is too long");
         }

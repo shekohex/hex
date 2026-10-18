@@ -59,6 +59,7 @@ struct SpeechInputs {
     model: Entity<TextInput>,
     language: Entity<TextInput>,
     hints: Entity<TextInput>,
+    retries: Entity<TextInput>,
     deadline: Entity<TextInput>,
 }
 
@@ -144,6 +145,7 @@ impl ProviderEditor {
                 cx,
             ),
             hints: input("Recognition hints (optional)", &speech.prompt, cx),
+            retries: input("0–10", &speech.max_retries.to_string(), cx),
             deadline: input("Seconds", &speech.deadline_seconds.to_string(), cx),
         };
         let mode_inputs = ModeInputs::new(&configuration.processing.default_mode, cx);
@@ -275,6 +277,16 @@ impl ProviderEditor {
                 self.speech.model = self.speech_inputs.model.read(cx).text().trim().into();
                 self.speech.language = self.speech_inputs.language.read(cx).text().trim().into();
                 self.speech.prompt = self.speech_inputs.hints.read(cx).text().into();
+                self.speech.max_retries = self
+                    .speech_inputs
+                    .retries
+                    .read(cx)
+                    .text()
+                    .trim()
+                    .parse()
+                    .map_err(|_| {
+                        color_eyre::eyre::eyre!("Realtime retries must be a number from 0 to 10")
+                    })?;
                 self.speech.deadline_seconds = self
                     .speech_inputs
                     .deadline
@@ -380,6 +392,12 @@ impl Render for ProviderEditor {
                     .child(field("Language", &self.speech_inputs.language))
                     .child(field("Recognition hints", &self.speech_inputs.hints))
                     .child(field("Deadline (seconds)", &self.speech_inputs.deadline))
+                    .when(self.speech.mode == TranscriptionMode::Realtime, |panel| {
+                        panel.child(field(
+                            "Connection retries (0–10)",
+                            &self.speech_inputs.retries,
+                        ))
+                    })
             });
         let mode_names = std::iter::once((None, "Global".to_owned()))
             .chain(

@@ -21,6 +21,8 @@ use crate::transcription_models::TranscriptionModelId;
 
 const VERSION: u32 = 1;
 const MAX_FRAME: usize = 128 * 1024;
+// A bounded 2 MiB transcript can expand sixfold when JSON-escaped. Audio is never sent.
+const MAX_REPLY_FRAME: usize = 16 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENTS: usize = 8;
 const UNIT: &str = "hex.service";
@@ -28,6 +30,13 @@ const UNIT: &str = "hex.service";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Snapshot,
+    RetryLast {
+        id: u64,
+        cleanup_only: bool,
+    },
+    ClearLast {
+        id: u64,
+    },
     Desktop(DesktopAction),
     CaptureShortcut,
     CancelShortcut,
@@ -48,6 +57,8 @@ pub enum Request {
 pub struct Snapshot {
     pub desktop: DesktopSnapshot,
     pub settings: LinuxSettings,
+    #[serde(default)]
+    pub last_dictation: Option<crate::linux_last_dictation::Snapshot>,
     pub editing: bool,
     pub capturing: bool,
     pub hud_limitation: Option<String>,
@@ -148,11 +159,15 @@ fn read_exact(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) 
 }
 
 fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+    read_frame_with_limit(stream, MAX_FRAME)
+}
+
+fn read_frame_with_limit<T: DeserializeOwned>(stream: &mut UnixStream, limit: usize) -> Result<T> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut header = [0; 4];
     read_exact(stream, &mut header, deadline)?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_FRAME {
+    if length == 0 || length > limit {
         bail!("Invalid HEX service frame size");
     }
     let mut body = vec![0; length];
@@ -161,8 +176,20 @@ fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
 }
 
 fn write_frame<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
+    write_frame_with_limit(stream, message, MAX_FRAME)
+}
+
+fn write_reply(stream: &mut UnixStream, reply: &Reply) -> Result<()> {
+    write_frame_with_limit(stream, reply, MAX_REPLY_FRAME)
+}
+
+fn write_frame_with_limit<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+    limit: usize,
+) -> Result<()> {
     let body = serde_json::to_vec(message)?;
-    if body.len() > MAX_FRAME {
+    if body.len() > limit {
         bail!("HEX service message exceeds the size limit");
     }
     let deadline = Instant::now() + IO_TIMEOUT;
@@ -208,7 +235,7 @@ fn exchange(stream: &mut UnixStream, request: Request) -> Result<(Snapshot, Opti
             request,
         },
     )?;
-    let reply: Reply = read_frame(stream)?;
+    let reply: Reply = read_frame_with_limit(stream, MAX_REPLY_FRAME)?;
     if reply.version != VERSION {
         bail!("HEX service version mismatch; restart the service");
     }
@@ -284,7 +311,7 @@ impl Server {
                                 break;
                             };
                             if message.version != VERSION {
-                                let _ = write_frame(
+                                let _ = write_reply(
                                     &mut stream,
                                     &Reply {
                                         version: VERSION,
@@ -311,7 +338,7 @@ impl Server {
                             let Ok((state, error)) = receiver.recv_timeout(IO_TIMEOUT) else {
                                 break;
                             };
-                            if write_frame(
+                            if write_reply(
                                 &mut stream,
                                 &Reply {
                                     version: VERSION,
@@ -642,6 +669,26 @@ mod tests {
             .write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())
             .unwrap();
         assert!(read_frame::<Message>(&mut server).is_err());
+    }
+
+    #[test]
+    fn replies_allow_bounded_retained_text_without_raising_request_limit() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let expected = "x".repeat(MAX_FRAME * 2);
+        let reply = Reply {
+            version: VERSION,
+            state: None,
+            error: Some(expected.clone()),
+        };
+        let writer = thread::spawn(move || write_reply(&mut server, &reply).unwrap());
+        let received: Reply = read_frame_with_limit(&mut client, MAX_REPLY_FRAME).unwrap();
+        writer.join().unwrap();
+        assert_eq!(received.error.as_deref(), Some(expected.as_str()));
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .write_all(&((MAX_REPLY_FRAME + 1) as u32).to_be_bytes())
+            .unwrap();
+        assert!(read_frame_with_limit::<Reply>(&mut server, MAX_REPLY_FRAME).is_err());
     }
 
     #[test]

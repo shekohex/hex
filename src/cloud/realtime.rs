@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use color_eyre::eyre::{Result, bail, eyre};
@@ -23,9 +23,66 @@ enum AudioMessage {
 /// One intentional recording. Admission never waits on network I/O.
 pub struct RealtimeSession {
     audio: Sender<AudioMessage>,
-    result: Receiver<Result<String, String>>,
+    result: Receiver<Result<String, SessionFailure>>,
+    settings: TranscriptionSettings,
     cancelled: Arc<AtomicBool>,
     offered_samples: usize,
+}
+
+#[derive(Debug)]
+struct SessionFailure {
+    message: String,
+    retryable: bool,
+}
+impl std::fmt::Display for SessionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for SessionFailure {}
+impl From<&str> for SessionFailure {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+pub struct RealtimeOutcome {
+    pub result: Result<String>,
+    pub retries: u8,
+}
+
+fn retryable(error: &color_eyre::eyre::Report) -> bool {
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+    if let Some(failure) = error.downcast_ref::<SessionFailure>() {
+        return failure.retryable;
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::ConnectionRefused
+        );
+    }
+    match error.downcast_ref::<Error>() {
+        Some(Error::Http(response)) => {
+            response.status().as_u16() == 429 || response.status().is_server_error()
+        }
+        Some(
+            Error::Io(_)
+            | Error::Tls(_)
+            | Error::ConnectionClosed
+            | Error::AlreadyClosed
+            | Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        ) => true,
+        _ => false,
+    }
 }
 
 impl RealtimeSession {
@@ -34,6 +91,7 @@ impl RealtimeSession {
         shutdown: Arc<AtomicBool>,
         mut observe: impl FnMut(&str) + Send + 'static,
     ) -> Self {
+        let retry_settings = settings.clone();
         let (audio, input) = channel(64);
         let (sender, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -49,12 +107,16 @@ impl RealtimeSession {
                     }
                 })
             })()
-            .map_err(|error| error.to_string());
+            .map_err(|error| SessionFailure {
+                retryable: retryable(&error),
+                message: error.to_string(),
+            });
             let _ = sender.try_send(result);
         });
         Self {
             audio,
             result,
+            settings: retry_settings,
             cancelled,
             offered_samples: 0,
         }
@@ -75,8 +137,70 @@ impl RealtimeSession {
         self.offered_samples
     }
 
-    /// Called by the output worker, never by the microphone loop.
+    #[cfg(test)]
     pub fn finish(
+        self,
+        samples: &[f32],
+        shutdown: &AtomicBool,
+        deadline: Duration,
+    ) -> Result<String> {
+        self.finish_with_metrics(samples, shutdown, deadline).result
+    }
+
+    /// Called by the output worker, never by the microphone loop.
+    pub fn finish_with_metrics(
+        self,
+        samples: &[f32],
+        shutdown: &AtomicBool,
+        deadline: Duration,
+    ) -> RealtimeOutcome {
+        let settings = self.settings.clone();
+        let started = Instant::now();
+        let mut initial = Some(self);
+        let mut attempted_retries = 0;
+        let result = (|| -> Result<String> {
+            for retries in 0..=settings.max_retries {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if shutdown.load(Ordering::Acquire) {
+                    bail!("Dictation cancelled");
+                }
+                if remaining.is_zero() {
+                    bail!("Realtime final transcript deadline expired");
+                }
+                attempted_retries = retries;
+                let session = initial.take().unwrap_or_else(|| {
+                    Self::start(settings.clone(), Arc::new(AtomicBool::new(false)), |_| {})
+                });
+                match session.finish_attempt(samples, shutdown, remaining) {
+                    Ok(text) => return Ok(text),
+                    Err(error) if retries < settings.max_retries && retryable(&error) => {
+                        tracing::warn!(
+                            retry = retries + 1,
+                            limit = settings.max_retries,
+                            "retrying realtime connection with retained audio"
+                        );
+                        let delay = Duration::from_millis(250 * (1u64 << retries.min(3)));
+                        run_cancellable(
+                            shutdown,
+                            deadline.saturating_sub(started.elapsed()),
+                            async {
+                                tokio::time::sleep(delay).await;
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("bounded retry loop always returns")
+        })();
+        RealtimeOutcome {
+            result,
+            retries: attempted_retries,
+        }
+    }
+
+    fn finish_attempt(
         self,
         samples: &[f32],
         shutdown: &AtomicBool,
@@ -137,7 +261,12 @@ async fn stream(
         tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
     .await
-    .map_err(|_| eyre!("Realtime connection timed out"))??;
+    .map_err(|_| {
+        eyre!(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Realtime connection timed out"
+        ))
+    })??;
     let mut transcription = json!({"model": settings.model});
     if !settings.language.is_empty() {
         if super::uses_language_list(&settings.model) {
@@ -180,7 +309,11 @@ async fn stream(
                 }
                 Some(Ok(Message::Ping(data))) => socket.send(Message::Pong(data)).await?,
                 Some(Ok(Message::Close(_))) | None => {
-                    bail!("Realtime connection closed during setup")
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "Realtime connection closed during setup",
+                    )
+                    .into());
                 }
                 Some(Err(error)) => return Err(error.into()),
                 _ => {}
@@ -188,7 +321,12 @@ async fn stream(
         }
     })
     .await
-    .map_err(|_| eyre!("Realtime session setup timed out"))??;
+    .map_err(|_| {
+        eyre!(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Realtime session setup timed out"
+        ))
+    })??;
 
     let mut resampler = Pcm24k::default();
     let mut turn_samples = 0;
@@ -279,8 +417,8 @@ async fn stream(
                         }
                     }
                     Some(Ok(Message::Ping(data))) => socket.send(Message::Pong(data)).await?,
-                    Some(Ok(Message::Close(_))) | None => bail!("Realtime connection closed before final transcript"),
-                    Some(Err(_)) => bail!("Realtime connection failed"),
+                    Some(Ok(Message::Close(_))) | None => return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "Realtime connection closed before final transcript").into()),
+                    Some(Err(error)) => return Err(error.into()),
                     _ => {}
                 }
             }
@@ -343,6 +481,7 @@ mod tests {
         let mut session = RealtimeSession {
             audio,
             result,
+            settings: Default::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
         };
@@ -375,6 +514,7 @@ mod tests {
         let mut session = RealtimeSession {
             audio,
             result,
+            settings: Default::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
         };
@@ -387,6 +527,177 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.to_string(), "Realtime session configuration failed");
+    }
+
+    fn accept_with_deadline(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(started.elapsed() < Duration::from_secs(5), "missing retry");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    fn fixture_settings(address: std::net::SocketAddr, max_retries: u8) -> TranscriptionSettings {
+        TranscriptionSettings {
+            connection: super::super::ConnectionSettings {
+                base_url: format!("http://{address}/v1"),
+                api_key_env: String::new(),
+                api_key_file: None,
+            },
+            model: "fixture".into(),
+            mode: super::super::TranscriptionMode::Realtime,
+            max_retries,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reconnect_replays_full_recording_after_partial_audio_disconnect() {
+        use tokio_tungstenite::tungstenite::accept;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let settings = fixture_settings(listener.local_addr().unwrap(), 2);
+        let (disconnected, partial_seen) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let mut first = accept(accept_with_deadline(&listener)).unwrap();
+            first.read().unwrap();
+            first
+                .send(Message::text(r#"{"type":"session.updated"}"#))
+                .unwrap();
+            let event: Value =
+                serde_json::from_str(first.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(event["type"], "input_audio_buffer.append");
+            drop(first);
+            disconnected.send(()).unwrap();
+            let mut second = accept(accept_with_deadline(&listener)).unwrap();
+            second.read().unwrap();
+            second
+                .send(Message::text(r#"{"type":"session.updated"}"#))
+                .unwrap();
+            let mut received = Vec::new();
+            loop {
+                let event: Value =
+                    serde_json::from_str(second.read().unwrap().to_text().unwrap()).unwrap();
+                match event["type"].as_str().unwrap() {
+                    "input_audio_buffer.append" => received.extend(
+                        BASE64_STANDARD
+                            .decode(event["audio"].as_str().unwrap())
+                            .unwrap(),
+                    ),
+                    "input_audio_buffer.commit" => {
+                        second
+                            .send(Message::text(
+                                r#"{"type":"input_audio_buffer.committed","item_id":"retry-1"}"#,
+                            ))
+                            .unwrap();
+                        second.send(Message::text(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"retry-1","transcript":"Recovered."}"#)).unwrap();
+                        assert!(
+                            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                        );
+                        return received;
+                    }
+                    _ => panic!("unexpected event"),
+                }
+            }
+        });
+        let audio = (0..16_001)
+            .map(|index| (index as f32 * 0.01).sin())
+            .collect::<Vec<_>>();
+        let mut session =
+            RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), |_| {});
+        session.offer(&audio[..1600]);
+        partial_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        let outcome =
+            session.finish_with_metrics(&audio, &AtomicBool::new(false), Duration::from_secs(5));
+        assert_eq!(outcome.result.unwrap(), "Recovered.");
+        assert_eq!(outcome.retries, 1);
+        let mut pcm = Pcm24k::default();
+        let mut expected = pcm.push(&audio);
+        expected.extend(pcm.finish());
+        assert_eq!(server.join().unwrap(), expected);
+    }
+
+    fn rejected_connections(
+        status: u16,
+        max_retries: u8,
+        expected_attempts: usize,
+        deadline: Duration,
+        cancel: bool,
+    ) -> RealtimeOutcome {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let settings = fixture_settings(listener.local_addr().unwrap(), max_retries);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..expected_attempts {
+                let mut stream = accept_with_deadline(&listener);
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            }
+            if cancel {
+                server_shutdown.store(true, Ordering::Release);
+            }
+            // Keep endpoint alive while the client completes, to detect extra attempts.
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        });
+        let outcome = RealtimeSession::start(settings, shutdown.clone(), |_| {})
+            .finish_with_metrics(&[0.25; 1600], &shutdown, deadline);
+        server.join().unwrap();
+        outcome
+    }
+
+    #[test]
+    fn transient_connection_retries_respect_zero_and_configured_limit() {
+        for retries in [0, 2] {
+            let outcome = rejected_connections(
+                503,
+                retries,
+                usize::from(retries) + 1,
+                Duration::from_secs(5),
+                false,
+            );
+            assert!(outcome.result.is_err());
+            assert_eq!(outcome.retries, retries);
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_never_retry() {
+        let outcome = rejected_connections(401, 2, 1, Duration::from_secs(5), false);
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.retries, 0);
+    }
+
+    #[test]
+    fn cancellation_and_shared_deadline_stop_backoff_before_another_attempt() {
+        for cancel in [false, true] {
+            let started = Instant::now();
+            let outcome = rejected_connections(429, 10, 1, Duration::from_millis(100), cancel);
+            assert!(outcome.result.is_err());
+            assert_eq!(outcome.retries, 0);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
     }
 
     #[test]

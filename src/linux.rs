@@ -125,6 +125,7 @@ pub fn run(shutdown: &'static AtomicBool) -> Result<()> {
                 settings,
                 None,
                 Default::default(),
+                Default::default(),
             )
         }
         Command::Devices => {

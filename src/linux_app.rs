@@ -110,6 +110,7 @@ struct LinuxDesktopHost {
     event_path: PathBuf,
     event_reader: EventReader,
     activity: DesktopActivity,
+    last_dictation: Arc<crate::linux_last_dictation::LastDictation>,
     listener: Option<Listener>,
     listen_when_ready: bool,
     status: String,
@@ -267,6 +268,7 @@ fn service_snapshot(host: &LinuxDesktopHost, owns_editor: bool) -> ServiceSnapsh
     ServiceSnapshot {
         desktop: host.snapshot(),
         settings: host.settings.clone(),
+        last_dictation: host.last_dictation.snapshot(),
         editing: host.settings_edit.is_some(),
         capturing: owns_editor && host.capturing_hotkey(),
         hud_limitation: crate::linux_desktop::hud_limitation(),
@@ -354,6 +356,16 @@ pub fn run_service(event_path: PathBuf, shutdown: &'static AtomicBool) -> Result
                     }
                     match request {
                         Request::Snapshot => {}
+                        Request::RetryLast { id, cleanup_only } => {
+                            if host.settings_edit.is_some() || !host.is_running() {
+                                return Err(color_eyre::eyre::eyre!(
+                                    "Wait for the listener to be ready before retrying"
+                                ));
+                            }
+                            host.last_dictation
+                                .request(crate::linux_last_dictation::Retry { id, cleanup_only })?;
+                        }
+                        Request::ClearLast { id } => host.last_dictation.clear(id)?,
                         Request::Desktop(action) => host.dispatch(action)?,
                         Request::CaptureShortcut => {
                             host.begin_settings_edit(SettingsChange::Capture);
@@ -531,6 +543,7 @@ impl LinuxDesktopHost {
             event_reader,
             event_path,
             activity,
+            last_dictation: Default::default(),
             listener: None,
             listen_when_ready: false,
             status: "Ready".into(),
@@ -578,6 +591,7 @@ impl LinuxDesktopHost {
         let prepared_transcriber = self.prepared_transcriber.take();
         let hotkey_status = crate::linux_input::HotkeyStatus::default();
         let worker_hotkey_status = hotkey_status.clone();
+        let last_dictation = self.last_dictation.clone();
         let worker = std::thread::spawn(move || {
             let result = crate::instance::acquire("listener").and_then(|_instance| {
                 crate::linux_dictation::run(
@@ -587,6 +601,7 @@ impl LinuxDesktopHost {
                     settings,
                     prepared_transcriber,
                     worker_hotkey_status,
+                    last_dictation,
                 )
             });
             result.map_err(|error| format!("{error:#}"))
@@ -1193,11 +1208,178 @@ impl LinuxApp {
             .into_any_element()
     }
 
+    fn render_last_dictation(
+        &mut self,
+        last: &crate::linux_last_dictation::Snapshot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = last.id;
+        let available =
+            !self.quitting && !self.host.editing_settings() && self.host.is_running() && !last.busy;
+        let audio_available = last.audio_available;
+        let raw_available = last.raw_available;
+        let copy_available = !last.text.is_empty();
+        let controls = div()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap_2()
+            .max_w(px(420.0))
+            .child(
+                compact_button("Retry transcription")
+                    .id("last-retranscribe")
+                    .when(!available || !last.audio_available, |button| {
+                        button.opacity(0.5)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if available && audio_available {
+                            let _ = this.host.send(Request::RetryLast {
+                                id,
+                                cleanup_only: false,
+                            });
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                compact_button("Retry cleanup")
+                    .id("last-reprocess")
+                    .when(!available || !last.raw_available, |button| {
+                        button.opacity(0.5)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if available && raw_available {
+                            let _ = this.host.send(Request::RetryLast {
+                                id,
+                                cleanup_only: true,
+                            });
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                compact_button("Copy")
+                    .id("last-copy")
+                    .when(!copy_available, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(result) = this
+                            .host
+                            .client
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.last_dictation.as_ref())
+                            .filter(|result| result.id == id && !result.text.is_empty())
+                        {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                result.text.clone(),
+                            ));
+                        }
+                    })),
+            )
+            .child(
+                compact_button("Clear")
+                    .id("last-clear")
+                    .when(last.busy, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.quitting {
+                            let _ = this.host.send(Request::ClearLast { id });
+                            cx.notify();
+                        }
+                    })),
+            );
+        let mut panel = settings_panel()
+            .when_some(last.error.clone(), |panel, error| {
+                panel.child(div().px_4().py_3().text_size(px(12.0)).child(error))
+            })
+            .child(settings_row(
+                "Last dictation",
+                if last.busy {
+                    "Processing · retained in RAM"
+                } else {
+                    "RAM only · cleared when HEX quits"
+                },
+                controls,
+            ))
+            .when(!last.text.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .id("last-dictation-preview")
+                        .px_4()
+                        .py_3()
+                        .max_h(px(160.0))
+                        .overflow_y_scroll()
+                        .overflow_x_hidden()
+                        .text_size(px(13.0))
+                        .child(last.text.chars().take(4000).collect::<String>())
+                        .when(last.text.chars().count() > 4000, |preview| {
+                            preview.child(
+                                div()
+                                    .mt_2()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(MUTED))
+                                    .child("Preview only; Copy includes the full result"),
+                            )
+                        }),
+                )
+            });
+        if let Some(timings) = &last.timings {
+            let duration = |value: Option<u64>| {
+                value
+                    .map(|ms| format!("{:.2} s", ms as f64 / 1000.0))
+                    .unwrap_or_else(|| "—".into())
+            };
+            let stages = [
+                ("Queue", Some(timings.queue_ms)),
+                (
+                    if timings.realtime {
+                        "Finalize transcript"
+                    } else {
+                        "Transcription"
+                    },
+                    timings.transcription_ms,
+                ),
+                ("Context wait", timings.context_wait_ms),
+                ("Cleanup", timings.cleanup_ms),
+                ("Paste", timings.paste_ms),
+                ("Total", Some(timings.total_ms)),
+            ];
+            panel =
+                panel.child(settings_row(
+                    "Timings",
+                    format!(
+                        "Audio {:.2} s · {} retries",
+                        timings.audio_ms as f64 / 1000.0,
+                        timings.retries
+                    ),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap_1()
+                        .text_size(px(12.0))
+                        .children(stages.into_iter().map(|(label, value)| {
+                            div().child(format!("{label}: {}", duration(value)))
+                        }))
+                        .border_b_0(),
+                ));
+        }
+        div()
+            .child(settings_section_label("LAST DICTATION"))
+            .child(panel)
+            .into_any_element()
+    }
+
     fn render_shared_settings(
         &mut self,
         snapshot: &DesktopSnapshot,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let last_dictation = self
+            .host
+            .client
+            .state
+            .as_ref()
+            .and_then(|state| state.last_dictation.clone());
         let running = snapshot.listener.running;
         let double_tap_lock = snapshot.double_tap_lock;
         let editing = self.host.editing_settings();
@@ -1328,6 +1510,7 @@ impl LinuxApp {
                                 .when_some(self.host.client.state.as_ref().and_then(|s| s.hud_limitation.clone()), |content, limitation| {
                                     content.child(div().mt_3().text_size(px(12.0)).text_color(rgb(MUTED)).child(limitation))
                                 })
+                                .when_some(last_dictation, |content, last| content.child(self.render_last_dictation(&last, cx)))
                                 .child(settings_section_label("DICTATION"))
                                 .child(
                                     settings_panel()

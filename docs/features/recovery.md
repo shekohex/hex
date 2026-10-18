@@ -261,6 +261,13 @@ succeeds.
 
 ### Keep Linux Listeners Managed
 
+Linux failed cloud dictation can be retried from **Settings > Last dictation**
+without speaking again. Audio/raw text/context remain in RAM until replaced,
+cleared, or service exit; see [retry and timing behavior](README.md#other-platforms-and-consumers).
+Transient realtime connections retry automatically up to the configured limit
+(default two retries) within the finalization deadline. Manual retries produce a
+copyable preview, not an automatic paste; the listener must be running.
+
 `recover.linux-listener`: Settings exposes listener status, Start/Stop, and
 Retry/Dismiss. Hiding a failure is not restarting its worker.
 

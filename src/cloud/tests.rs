@@ -871,3 +871,16 @@ fn ocr_context_sends_text_never_image_bytes_and_preserves_custom_instructions() 
     assert!(!body.contains("clipboard-not-opted-in"));
     worker.join().unwrap();
 }
+
+#[test]
+fn legacy_transcription_settings_default_to_two_retries_and_reject_excessive_counts() {
+    let mut settings: TranscriptionSettings =
+        serde_json::from_value(json!({"model": "fixture"})).unwrap();
+    assert_eq!(settings.max_retries, 2);
+    settings.max_retries = 0;
+    settings.validate().unwrap();
+    settings.max_retries = 10;
+    settings.validate().unwrap();
+    settings.max_retries = 11;
+    assert!(settings.validate().is_err());
+}

@@ -189,8 +189,12 @@ Enter API base URL and exact model ID. Transcription needs the provider's
 Chat Completions compatibility alone does not imply either exists. File-response
 streaming is not live audio input. Realtime disables server turn detection: the
 shortcut controls finalization. Uploads split into 120-second requests; realtime
-commits bounded turns. Disconnects and missing final acknowledgments
-fail without pasting partial text. No automatic provider/local fallback.
+commits bounded turns. **Connection retries (0–10)** defaults to 2 retries after
+initial failure. After release, transient transport failures, HTTP 429, and HTTP
+5xx reconnect with bounded backoff and replay the full captured audio. Attempts
+share the finalization deadline; Escape cancels retries. Authentication, model,
+and configuration errors do not retry. Exhausted retries or missing final
+acknowledgments fail without pasting partial text. No provider/local fallback.
 Temporary realtime queue pressure defers unsent audio in the authoritative capture;
 subsequent callbacks retry it, and release drains the remaining suffix on the
 output worker within the configured deadline. Capture never waits for network I/O,
@@ -214,6 +218,31 @@ preserved. Application matching is exact and case-insensitive: WM_CLASS on X11,
 class on Hyprland, app_id/class on Sway, or application names exposed by AT-SPI.
 Modes replace Global rather than layering. JSON `replacements` entries support
 `matched_phrase` and `output`. Cleanup failure preserves corrected transcription.
+
+### Last Dictation And Timings
+
+**Settings > Last dictation** retains one recording in service memory, including
+failed transcription. New accepted recording replaces it. No audio file or
+persistent history is created; Clear or quitting/restarting the service removes
+it. Closing Settings or editing provider settings does not remove it.
+
+- **Retry transcription:** current speech configuration, then current cleanup.
+- **Retry cleanup:** saved raw transcript, current mode/instructions/model; no
+  speech-provider call. Both retries reuse original captured context, not Settings.
+- Retries run on the existing bounded worker queue, require a running listener,
+  and show their result here without pasting. **Copy** copies full result.
+- Audio retention caps at **32 MiB** (about 8 minutes of 16 kHz float PCM).
+  Longer recordings still transcribe normally, but only text can be retried.
+  Raw/final text each cap at 2 MiB; preview shows 4,000 characters.
+
+Latest result shows audio duration, automatic retry count, queue wait,
+transcription, context wait, cleanup, paste, and total time. Structured logs and
+NDJSON dictation events contain the same timings, including completed stages on
+failure. Skipped stages show “—”. Realtime **Finalize transcript** measures
+post-release finalization (including reconnect/replay), not transcription already
+performed while speaking. **Context wait** measures remaining wait, not background
+capture duration. **Total** starts at release/job submission and includes queue
+wait; manual retry has no paste stage.
 
 ### Thinking
 

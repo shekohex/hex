@@ -116,12 +116,14 @@ mod tests {
                 phase: DictationPhase::Failed("first".into()),
                 text: String::new(),
                 processing: None,
+                timings: None,
             },
             VoiceEvent::Dictation {
                 timestamp_ms: 3,
                 phase: DictationPhase::Failed("second".into()),
                 text: String::new(),
                 processing: None,
+                timings: None,
             },
         ];
         assert_eq!(

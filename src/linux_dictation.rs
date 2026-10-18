@@ -10,7 +10,9 @@ use color_eyre::eyre::eyre;
 
 use crate::audio::{AudioInputEvent, CaptureInstant};
 use crate::dictation::{DictationCapture, Finish};
-use crate::events::{DictationPhase, EventLog, TranscriptPhase, VoiceEvent, VoiceState, now_ms};
+use crate::events::{
+    DictationPhase, DictationTimings, EventLog, TranscriptPhase, VoiceEvent, VoiceState, now_ms,
+};
 use crate::feedback::{self, Tone};
 use crate::linux_desktop::LinuxIndicator;
 use crate::linux_input::{HotkeyEvent, HotkeyStatus, LinuxHotkeyMonitor};
@@ -27,7 +29,10 @@ struct CaptureWork {
 }
 
 struct Job {
-    samples: Vec<f32>,
+    samples: Arc<Vec<f32>>,
+    recording_id: u64,
+    released_at: Instant,
+    retry: Option<crate::linux_last_dictation::Recording>,
     audio_ms: u64,
     context: Option<crate::linux_context::ContextCapture>,
     realtime: Option<crate::cloud::RealtimeSession>,
@@ -96,6 +101,7 @@ pub fn run(
     settings: crate::linux_settings::LinuxSettings,
     transcriber: Option<LinuxTranscriber>,
     hotkey_status: HotkeyStatus,
+    last: Arc<crate::linux_last_dictation::LastDictation>,
 ) -> Result<()> {
     let transcriber = if settings.cloud_transcription.is_none() {
         Some(transcriber.map_or_else(|| LinuxTranscriber::load(&settings.transcription), Ok)?)
@@ -104,6 +110,7 @@ pub fn run(
     };
     // Drop audio/hotkeys and close the job queue before joining slow output on
     // every exit, including failures during startup or recording.
+    let retry_connection = last.connect();
     let mut output = OutputWorker {
         stop: Arc::new(AtomicBool::new(false)),
         worker: None,
@@ -131,6 +138,7 @@ pub fn run(
     let processing = settings.processing.clone();
     let observations = EventLog::create(event_path)?;
     let partial_events = observations.clone();
+    let worker_last = last.clone();
     output.worker = Some(thread::spawn(move || {
         let mut transcriber = transcriber;
         let mut paster = LinuxPaster::new(
@@ -143,80 +151,153 @@ pub fn run(
                 break;
             }
             let started = Instant::now();
+            let preview = job.retry.is_some();
+            let mut pending_context = job.context;
+            let mut processed_text = None;
+            let mut timings = DictationTimings {
+                audio_ms: job.audio_ms,
+                realtime: settings
+                    .cloud_transcription
+                    .as_ref()
+                    .is_some_and(|cloud| cloud.mode == crate::cloud::TranscriptionMode::Realtime),
+                queue_ms: job.released_at.elapsed().as_millis() as u64,
+                ..Default::default()
+            };
             let result = (|| -> Result<(String, Option<crate::events::DictationProcessing>)> {
                 if job.control.cancelled.load(Ordering::Acquire) {
                     return Err(eyre!("Dictation cancelled"));
                 }
-                let text = if let Some(cloud) = &settings.cloud_transcription {
-                    if let Some(realtime) = job.realtime {
-                        realtime.finish(
-                            &job.samples,
-                            &job.control.cancelled,
-                            Duration::from_secs(cloud.deadline_seconds),
-                        )?
-                    } else if cloud.mode == crate::cloud::TranscriptionMode::Realtime {
-                        crate::cloud::RealtimeSession::start(
-                            cloud.clone(),
-                            job.control.cancelled.clone(),
-                            |_| {},
-                        )
-                        .finish(
-                            &job.samples,
-                            &job.control.cancelled,
-                            Duration::from_secs(cloud.deadline_seconds),
-                        )?
+                let text =
+                    if let Some(text) = job.retry.as_ref().and_then(|retry| retry.raw.clone()) {
+                        text
                     } else {
-                        crate::cloud::transcribe(
-                            cloud,
-                            &job.samples,
-                            &job.control.cancelled,
-                            |text| {
-                                let _ = partial_events.emit(&VoiceEvent::Transcript {
-                                    timestamp_ms: now_ms(),
-                                    phase: TranscriptPhase::Updated,
-                                    latency_ms: 0,
-                                    text: text.to_owned(),
-                                });
-                            },
-                        )?
-                    }
-                } else {
-                    let mut samples = job.samples;
-                    crate::dictation::pad_for_parakeet(&mut samples);
-                    transcriber
-                        .as_mut()
-                        .expect("local selection has a transcriber")
-                        .transcribe(&samples)?
-                };
+                        measure_stage(&mut timings.transcription_ms, || -> Result<String> {
+                            let text = if let Some(cloud) = &settings.cloud_transcription {
+                                if let Some(realtime) = job.realtime {
+                                    let outcome = realtime.finish_with_metrics(
+                                        &job.samples,
+                                        &job.control.cancelled,
+                                        Duration::from_secs(cloud.deadline_seconds),
+                                    );
+                                    timings.retries = outcome.retries;
+                                    outcome.result?
+                                } else if cloud.mode == crate::cloud::TranscriptionMode::Realtime {
+                                    let outcome = crate::cloud::RealtimeSession::start(
+                                        cloud.clone(),
+                                        job.control.cancelled.clone(),
+                                        |_| {},
+                                    )
+                                    .finish_with_metrics(
+                                        &job.samples,
+                                        &job.control.cancelled,
+                                        Duration::from_secs(cloud.deadline_seconds),
+                                    );
+                                    timings.retries = outcome.retries;
+                                    outcome.result?
+                                } else {
+                                    crate::cloud::transcribe(
+                                        cloud,
+                                        &job.samples,
+                                        &job.control.cancelled,
+                                        |text| {
+                                            let _ = partial_events.emit(&VoiceEvent::Transcript {
+                                                timestamp_ms: now_ms(),
+                                                phase: TranscriptPhase::Updated,
+                                                latency_ms: 0,
+                                                text: text.to_owned(),
+                                            });
+                                        },
+                                    )?
+                                }
+                            } else {
+                                let mut samples = (*job.samples).clone();
+                                crate::dictation::pad_for_parakeet(&mut samples);
+                                transcriber
+                                    .as_mut()
+                                    .expect("local selection has a transcriber")
+                                    .transcribe(&samples)?
+                            };
+                            Ok(text)
+                        })?
+                    };
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     return Err(eyre!("transcription was empty"));
                 }
-                let context = job
-                    .context
-                    .map(crate::linux_context::ContextCapture::take)
-                    .unwrap_or_default();
+                let context = measure_stage(&mut timings.context_wait_ms, || {
+                    job.retry
+                        .as_ref()
+                        .map(|retry| retry.context.clone())
+                        .unwrap_or_else(|| {
+                            Arc::new(
+                                pending_context
+                                    .take()
+                                    .map(crate::linux_context::ContextCapture::take)
+                                    .unwrap_or_default(),
+                            )
+                        })
+                });
+                worker_last.raw(job.recording_id, &text, context.clone());
                 let (text, observation) =
                     settings
                         .processing
                         .process(&text, &context, &job.control.cancelled);
+                timings.cleanup_ms = observation.as_ref().map(|processing| processing.latency_ms);
+                processed_text = Some(text.clone());
                 if worker_stop.load(Ordering::Acquire) {
                     job.control.cancel();
                 }
-                paster
-                    .as_mut()
-                    .map_err(|error| eyre!("{error:#}"))?
-                    .paste_with_commit(&text, &job.control.cancelled, || job.control.commit())?;
+                if !preview {
+                    measure_stage(&mut timings.paste_ms, || -> Result<()> {
+                        paster
+                            .as_mut()
+                            .map_err(|error| eyre!("{error:#}"))?
+                            .paste_with_commit(&text, &job.control.cancelled, || {
+                                job.control.commit()
+                            })
+                    })?;
+                } else if job.control.cancelled.load(Ordering::Acquire) {
+                    return Err(eyre!("Dictation cancelled"));
+                }
                 Ok((text, observation))
             })()
             .map_err(|error| format!("{error:#}"));
+            // Preserve original focus context even if ASR failed before cleanup.
+            if let Some(context) = pending_context.take() {
+                let context =
+                    measure_stage(&mut timings.context_wait_ms, || Arc::new(context.take()));
+                worker_last.context(job.recording_id, context);
+            }
             job.control.finish();
+            timings.total_ms = job.released_at.elapsed().as_millis() as u64;
+            worker_last.finish(
+                job.recording_id,
+                processed_text
+                    .as_deref()
+                    .filter(|_| !job.control.cancelled.load(Ordering::Acquire)),
+                result.as_ref().err().cloned().or_else(|| {
+                    result.as_ref().ok().and_then(|(_, processing)| {
+                        processing
+                            .as_ref()
+                            .and_then(|processing| processing.fallback.clone())
+                    })
+                }),
+                Some(timings.clone()),
+            );
             tracing::info!(
                 audio_ms = job.audio_ms,
+                queue_ms = timings.queue_ms,
+                transcription_ms = ?timings.transcription_ms,
+                context_wait_ms = ?timings.context_wait_ms,
+                cleanup_ms = ?timings.cleanup_ms,
+                paste_ms = ?timings.paste_ms,
+                total_ms = timings.total_ms,
+                retries = timings.retries,
+                preview,
                 elapsed_ms = started.elapsed().as_millis(),
                 "completed Linux dictation job"
             );
-            if result_sender.send(result).is_err() {
+            if result_sender.send((result, timings, preview)).is_err() {
                 break;
             }
         }
@@ -243,6 +324,36 @@ pub fn run(
     while !shutdown.load(Ordering::Relaxed) {
         if let Ok(error) = hotkey.errors.try_recv() {
             return Err(eyre!("Linux hotkey monitor stopped: {error}"));
+        }
+        while let Ok(retry) = retry_connection.requests.try_recv() {
+            match last.recording(retry).and_then(|recording| {
+                let control = Arc::new(JobControl::default());
+                let samples = recording.samples.clone();
+                let job = Job {
+                    audio_ms: samples.len() as u64 * 1000 / 16_000,
+                    samples,
+                    recording_id: retry.id,
+                    released_at: Instant::now(),
+                    context: None,
+                    realtime: None,
+                    retry: Some(recording),
+                    control: control.clone(),
+                };
+                jobs.try_send(job)
+                    .map_err(|_| eyre!("Dictation queue is busy; retry again shortly"))?;
+                output.unfinished.push_back(control);
+                pending += 1;
+                hotkey_status.set_output_pending(true);
+                events.dictation(DictationPhase::Transcribing, "")?;
+                Ok(())
+            }) {
+                Ok(()) => emit_state(
+                    &mut events,
+                    active_state(capture.is_recording(), pending),
+                    &device_name,
+                )?,
+                Err(error) => last.finish(retry.id, None, Some(error.to_string()), None),
+            }
         }
         while let Ok(action) = hotkey.events.try_recv() {
             match action {
@@ -282,6 +393,7 @@ pub fn run(
                         &mut events,
                         &mut pending,
                         std::mem::take(&mut capture_work),
+                        &last,
                     )?;
                     if pending > previous_pending {
                         output.unfinished.push_back(control);
@@ -317,7 +429,7 @@ pub fn run(
                 _ => {}
             }
         }
-        while let Ok(result) = results.try_recv() {
+        while let Ok((result, timings, preview)) = results.try_recv() {
             pending = pending.saturating_sub(1);
             hotkey_status.set_output_pending(pending > 0);
             let cancelled = output
@@ -325,19 +437,34 @@ pub fn run(
                 .pop_front()
                 .is_some_and(|job| job.cancelled.load(Ordering::Acquire));
             if cancelled {
-                events.dictation(DictationPhase::Cancelled, "")?;
+                events.timed_dictation(DictationPhase::Cancelled, "", None, timings)?;
             } else {
                 match result {
                     Ok((text, processing)) => {
                         events.emit(&VoiceEvent::Transcript {
                             timestamp_ms: now_ms(),
                             phase: TranscriptPhase::Completed,
-                            latency_ms: 0,
+                            latency_ms: timings
+                                .transcription_ms
+                                .unwrap_or_default()
+                                .min(u64::from(u32::MAX))
+                                as u32,
                             text: text.clone(),
                         })?;
-                        events.processed_dictation(DictationPhase::Pasted, text, processing)?;
+                        events.timed_dictation(
+                            if preview {
+                                DictationPhase::Edited
+                            } else {
+                                DictationPhase::Pasted
+                            },
+                            text,
+                            processing,
+                            timings,
+                        )?;
                     }
-                    Err(error) => events.dictation(DictationPhase::Failed(error), "")?,
+                    Err(error) => {
+                        events.timed_dictation(DictationPhase::Failed(error), "", None, timings)?
+                    }
                 }
             }
             emit_state(
@@ -471,6 +598,7 @@ fn submit_capture(
     events: &mut EventLog,
     pending: &mut usize,
     work: CaptureWork,
+    last: &crate::linux_last_dictation::LastDictation,
 ) -> Result<()> {
     let CaptureWork {
         context,
@@ -485,8 +613,14 @@ fn submit_capture(
         Finish::Transcribe(clip) => {
             feedback::play(Tone::DictationStop);
             let audio_ms = clip.duration_ms();
+            let released_at = Instant::now();
+            let samples = Arc::new(clip.into_transcription_samples());
+            let recording_id = last.retain(samples.clone());
             let job = Job {
-                samples: clip.into_transcription_samples(),
+                samples,
+                recording_id,
+                released_at,
+                retry: None,
                 audio_ms,
                 context,
                 realtime,
@@ -497,8 +631,16 @@ fn submit_capture(
                     *pending += 1;
                     events.dictation(DictationPhase::Transcribing, "")?;
                 }
-                Err(TrySendError::Full(_)) => events
-                    .dictation(DictationPhase::Failed("dictation queue is full".into()), "")?,
+                Err(TrySendError::Full(_)) => {
+                    last.finish(
+                        recording_id,
+                        None,
+                        Some("dictation queue is full".into()),
+                        None,
+                    );
+                    events
+                        .dictation(DictationPhase::Failed("dictation queue is full".into()), "")?;
+                }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(eyre!("dictation worker is unavailable"));
                 }
@@ -506,6 +648,13 @@ fn submit_capture(
         }
     }
     Ok(())
+}
+
+fn measure_stage<T>(duration: &mut Option<u64>, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = operation();
+    *duration = Some(started.elapsed().as_millis() as u64);
+    result
 }
 
 fn active_state(recording: bool, pending: usize) -> VoiceState {

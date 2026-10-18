@@ -622,7 +622,9 @@ Linux Settings > Models & Processing      // dictate.providers.linux
 ├── Cloud / Stream -> Compatible audio upload, optional response SSE
 └── Realtime -> Intentional capture -> Bounded audio projection -> Commit -> Final
     ├── Temporary queue pressure -> Retain unsent capture suffix -> Retry / drain at release
-    └── Failure / missing final -> No partial paste
+    ├── Transient disconnect / HTTP 429 or 5xx -> Up to N reconnects after release
+    │   └── Full capture replay; shared deadline; default 2 retries, configurable 0–10
+    └── Exhausted / permanent failure / missing final -> No partial paste
 
 Processing Modes                         // modes.providers.linux
 ├── Application match -> Mode replaces Global
@@ -677,6 +679,52 @@ synthetic pixels only. These are not live provider, physical capture/paste,
 desktop Accessibility, or screen-OCR-quality proof. OpenCode accepts OCR text,
 not image upload. Wayland needs compatible screenshot support and focused-window
 geometry; captured rectangles may include overlapping content.
+
+```ts
+Linux Settings > Last dictation          // dictate.retry.linux
+├── Accepted recording -> Replace one RAM-only audio/raw/context/result record
+│   └── Failed ASR -> Keep audio and original context for another attempt
+├── Retry transcription -> Current speech config -> Current cleanup -> Preview
+├── Retry cleanup -> Saved raw text + original context -> Current cleanup -> Preview
+├── Copy -> Full latest result; retries never paste into Settings
+└── Clear / service exit -> Drop retained record; Settings close does not clear it
+
+Latest result + structured logs          // dictate.timings.linux
+├── Audio length + automatic retry count
+├── Queue -> Transcription/finalization -> Context wait -> Cleanup -> Paste
+└── Total since release/submission; failed jobs retain measured stages
+```
+
+Sources: [RAM owner](../../src/linux_last_dictation.rs),
+[worker](../../src/linux_dictation.rs), [Settings](../../src/linux_app.rs),
+[transport](../../src/linux_service.rs), and [events](../../src/events.rs).
+The service retains at most 32 MiB of 16 kHz float audio (about eight minutes),
+2 MiB each of raw/final text, and the existing bounded original context. Longer
+recordings still transcribe but have no audio retry. Preview caps at 4,000
+characters; Copy uses full retained text. Retrying needs a running listener and
+uses the same bounded ordered worker queue. Provider-setting edits preserve the
+RAM record; the next retry uses new settings. Replacing a record fences old
+completions, retries, and Clear actions by ID. This is not persistent History.
+IPC requests stay capped at 128 KiB; replies allow 16 MiB for JSON-escaped text,
+with the existing peer-UID checks and I/O deadlines. Audio/context never cross IPC.
+
+Retries occur after release for transient connection failures or HTTP 429/5xx,
+not invalid credentials/configuration. Backoff, reconnect, replay, and finalization
+share one deadline; cancellation stops all attempts. No partial output is pasted.
+Realtime timing measures finalization after worker admission, not overlapping live
+ASR. Context timing measures remaining wait, not capture work. Skipped stages are
+absent; cleanup fallback retains latency/error. Manual retry skips paste and
+cleanup-only retry skips ASR. Normal paste failure still exposes generated text.
+
+Checks in [realtime tests](../../src/cloud/realtime.rs) disconnect after receiving
+partial audio and compare replayed PCM against the entire clip. Other checks
+exercise retry limits (including zero), permanent HTTP 401, cancellation/shared
+deadline during HTTP 429 backoff, RAM lifetime, failed-ASR context retention, raw
+rather than enhanced cleanup input, stale-ID fencing, audio cap, large bounded
+replies, and failed-stage event serialization. These are loopback/state checks;
+native new-button interaction and live-gateway retry remain unverified.
+The full debug suite passed (273 tests, 16 opt-in checks skipped), followed by
+strict all-target/all-feature Clippy and formatting on October 18, 2026.
 
 Thinking presets persist per mode and survive restart; older settings retain
 provider defaults. Chat and Responses expose Off through Max; native Gemini uses

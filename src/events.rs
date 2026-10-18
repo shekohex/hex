@@ -44,6 +44,8 @@ pub enum VoiceEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         processing: Option<DictationProcessing>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timings: Option<DictationTimings>,
     },
     Context {
         timestamp_ms: u64,
@@ -127,6 +129,21 @@ pub struct DictationProcessing {
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+}
+
+/// Client-observed durations. Realtime transcription overlaps recording; its
+/// transcription_ms is only the finalization wait after the output worker starts.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DictationTimings {
+    pub audio_ms: u64,
+    pub realtime: bool,
+    pub retries: u8,
+    pub queue_ms: u64,
+    pub transcription_ms: Option<u64>,
+    pub context_wait_ms: Option<u64>,
+    pub cleanup_ms: Option<u64>,
+    pub paste_ms: Option<u64>,
+    pub total_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -261,6 +278,7 @@ impl EventLog {
             phase,
             text: text.into(),
             processing: None,
+            timings: None,
         })
     }
 
@@ -275,6 +293,24 @@ impl EventLog {
             phase,
             text: text.into(),
             processing,
+            timings: None,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn timed_dictation(
+        &self,
+        phase: DictationPhase,
+        text: impl Into<String>,
+        processing: Option<DictationProcessing>,
+        timings: DictationTimings,
+    ) -> io::Result<()> {
+        self.emit(&VoiceEvent::Dictation {
+            timestamp_ms: now_ms(),
+            phase,
+            text: text.into(),
+            processing,
+            timings: Some(timings),
         })
     }
 }
@@ -543,6 +579,7 @@ mod tests {
                 latency_ms: 321,
                 fallback: Some("deadline exceeded".into()),
             }),
+            timings: None,
         };
 
         let decoded: VoiceEvent =
@@ -558,6 +595,41 @@ mod tests {
                 }),
                 ..
             } if profile == "slack" && fallback == "deadline exceeded"
+        ));
+    }
+
+    #[test]
+    fn failed_dictation_preserves_completed_and_skipped_stage_timings() {
+        let timings = DictationTimings {
+            audio_ms: 3000,
+            realtime: true,
+            retries: 2,
+            queue_ms: 10,
+            transcription_ms: Some(1500),
+            total_ms: 1510,
+            ..Default::default()
+        };
+        let event = VoiceEvent::Dictation {
+            timestamp_ms: 42,
+            phase: DictationPhase::Failed("connection lost".into()),
+            text: String::new(),
+            processing: None,
+            timings: Some(timings.clone()),
+        };
+        let decoded: VoiceEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(decoded, event);
+        assert!(matches!(
+            decoded,
+            VoiceEvent::Dictation {
+                timings: Some(DictationTimings {
+                    cleanup_ms: None,
+                    paste_ms: None,
+                    retries: 2,
+                    ..
+                }),
+                ..
+            }
         ));
     }
 

@@ -73,6 +73,8 @@ mod linux_gnome;
 #[cfg(target_os = "linux")]
 mod linux_input;
 #[cfg(target_os = "linux")]
+mod linux_last_dictation;
+#[cfg(target_os = "linux")]
 mod linux_media;
 #[cfg(target_os = "linux")]
 mod linux_microphone;
