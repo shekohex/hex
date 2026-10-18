@@ -679,6 +679,22 @@ desktop shortcuts fail explicitly; Settings uses focused shortcut capture.
 No unsafe Shell evaluation, whole-desktop fallback, evdev, wtype, or XWayland.
 The click-through Shell HUD replaces the wlroots layer-shell overlay.
 
+**GNOME 50 startup/release correction:** installed 50.4 rejected the removed
+`affectsInputRegion` chrome parameter, leaving a partially initialized extension
+in ERROR while the service could still acquire its D-Bus endpoint. Startup now
+uses the nonreactive label without that option and releases partial D-Bus,
+signal, and actor resources on failure. Accelerator grabs explicitly request
+`TRIGGER_RELEASE`; otherwise Mutter delivers presses but not releases, leaving
+hold-to-dictate captures unfinished. Existing observations showed recording
+starts without completion. Native-keypress verification of the corrected build
+still requires a new GNOME login because extension modules are cached.
+
+`node --test gnome/extension.test.cjs` reproduced both failures with strict
+GNOME-50 chrome options and release-flag-aware accelerator mocks, then passed
+all seven checks after correction. These tests do not open a microphone or send
+provider requests. Terminal insertion separately requires the persisted
+Ctrl-Shift-V preference for terminals that do not accept Ctrl-V.
+
 Executed on the Linux working tree: 251 Rust tests, five compositor-mock adapter
 checks, and strict all-target Clippy passed. Mocks cover lease ownership, cleanup,
 shortcut conflicts, focus changes, balanced key releases, and locked-desktop

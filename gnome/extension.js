@@ -16,45 +16,56 @@ const MODIFIERS = Clutter.ModifierType.SHIFT_MASK | Clutter.ModifierType.CONTROL
 
 export default class HexExtension extends Extension {
     enable() {
-        const [, xml] = GLib.file_get_contents(`${this.path}/interface.xml`);
-        this._object = Gio.DBusExportedObject.wrapJSObject(new TextDecoder().decode(xml), this);
-        this._object.export(Gio.DBus.session, PATH);
-        this._bus = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS,
-            Gio.BusNameOwnerFlags.NONE, null, null);
-        this._nextLease = 0;
-        this._signals = [
-            global.display.connect('accelerator-activated', (_display, action) => {
+        try {
+            const [, xml] = GLib.file_get_contents(`${this.path}/interface.xml`);
+            this._object = Gio.DBusExportedObject.wrapJSObject(new TextDecoder().decode(xml), this);
+            this._object.export(Gio.DBus.session, PATH);
+            this._bus = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS,
+                Gio.BusNameOwnerFlags.NONE, null, null);
+            this._nextLease = 0;
+            this._signals = [];
+            this._signals.push(global.display.connect('accelerator-activated', (_display, action) => {
                 if (action === this._shortcut)
                     this._emit('Shortcut', '(ub)', [this._lease, true]);
                 else if (action === this._escape)
                     this._emit('Cancel', '(u)', [this._lease]);
-            }),
-            global.display.connect('accelerator-deactivated', (_display, action) => {
+            }));
+            this._signals.push(global.display.connect('accelerator-deactivated', (_display, action) => {
                 if (action === this._shortcut)
                     this._emit('Shortcut', '(ub)', [this._lease, false]);
-            }),
-        ];
-        this._modeSignal = Main.sessionMode.connect('updated', () => {
-            if (Main.sessionMode.isLocked && this._owner) {
-                this._emit('Cancel', '(u)', [this._lease]);
-                this._showState(0);
-            }
-        });
-        this._label = new St.Label({
-            reactive: false, can_focus: false, visible: false,
-            style: 'background-color: #171717; color: #eeeeee; border: 1px solid #292929; border-radius: 18px; padding: 9px 18px; font-size: 13px;',
-        });
-        Main.layoutManager.addChrome(this._label, {affectsInputRegion: false});
+            }));
+            this._modeSignal = Main.sessionMode.connect('updated', () => {
+                if (Main.sessionMode.isLocked && this._owner) {
+                    this._emit('Cancel', '(u)', [this._lease]);
+                    this._showState(0);
+                }
+            });
+            this._label = new St.Label({
+                reactive: false, can_focus: false, visible: false,
+                style: 'background-color: #171717; color: #eeeeee; border: 1px solid #292929; border-radius: 18px; padding: 9px 18px; font-size: 13px;',
+            });
+            Main.layoutManager.addChrome(this._label);
+        } catch (error) {
+            this.disable();
+            throw error;
+        }
     }
 
     disable() {
         this._reset();
         for (const signal of this._signals ?? [])
             global.display.disconnect(signal);
-        Main.sessionMode.disconnect(this._modeSignal);
-        this._label.destroy();
-        this._object.unexport();
-        Gio.bus_unown_name(this._bus);
+        this._signals = [];
+        if (this._modeSignal)
+            Main.sessionMode.disconnect(this._modeSignal);
+        this._modeSignal = 0;
+        this._label?.destroy();
+        this._label = null;
+        this._object?.unexport();
+        this._object = null;
+        if (this._bus)
+            Gio.bus_unown_name(this._bus);
+        this._bus = 0;
         this._virtualKeyboard = null;
     }
 
@@ -82,7 +93,7 @@ export default class HexExtension extends Extension {
 
     _grab(accelerator) {
         const action = global.display.grab_accelerator(accelerator,
-            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT);
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT | Meta.KeyBindingFlags.TRIGGER_RELEASE);
         if (action !== Meta.KeyBindingAction.NONE)
             Main.wm.allowKeybinding(Meta.external_binding_name_for_action(action), Shell.ActionMode.NORMAL);
         return action;

@@ -277,6 +277,9 @@ fallback, root service, or `/dev/input` access is required.
 The extension adapts compositor shortcuts, clipboard insertion, focused-window
 capture, and the click-through recording/processing indicator. Rust still owns
 recording, double-tap locking, cancellation, provider calls, and output order.
+The shortcut grab requests release notifications as well as presses; the HUD
+uses a nonreactive label without the removed GNOME 50 input-region option.
+Failed startup releases partially initialized compositor and D-Bus resources.
 Its D-Bus lease belongs to one listener connection; disconnect/disable releases
 shortcut grabs and hides the indicator. Locked desktops reject context and paste.
 Only the registered shortcut is observed, not arbitrary physical keys.
@@ -294,6 +297,8 @@ Disabling the extension makes the listener fail visibly; Settings remains usable
 
 Adapter tests use compositor mocks, not the live Shell. Physical shortcut,
 context, paste, and HUD behavior still require native verification after login.
+After updating extension code, log out/in again: GNOME caches loaded JavaScript
+modules, so toggling the extension does not load the corrected source.
 API references: [Mutter accelerators](https://gnome.pages.gitlab.gnome.org/mutter/meta/method.Display.grab_accelerator.html),
 [focused-window capture](https://gnome.pages.gitlab.gnome.org/gnome-shell/shell/method.Screenshot.screenshot_window.html).
 

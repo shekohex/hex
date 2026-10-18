@@ -8,9 +8,10 @@ const source = fs.readFileSync(`${__dirname}/extension.js`, 'utf8')
     .replace(/^import .*;\n/gm, '')
     .replace('export default class HexExtension', 'globalThis.HexExtension = class HexExtension');
 
-function fixture() {
+function fixture({enable = true} = {}) {
     const signals = new Map();
     const grabs = new Map();
+    const grabFlags = new Map();
     const watches = new Map();
     const emitted = [];
     const keys = [];
@@ -22,13 +23,18 @@ function fixture() {
         focus_window: window,
         connect: (name, callback) => { signals.set(name, callback); return name; },
         disconnect: name => signals.delete(name),
-        grab_accelerator: accelerator => {
+        grab_accelerator: (accelerator, flags) => {
             if (state.conflict) return 0;
             const id = nextAction++;
             grabs.set(id, accelerator);
+            grabFlags.set(id, flags);
             return id;
         },
         ungrab_accelerator: id => grabs.delete(id),
+        shortcutEdge: (action, pressed) => {
+            if (pressed || (grabFlags.get(action) & 128))
+                signals.get(pressed ? 'accelerator-activated' : 'accelerator-deactivated')(null, action);
+        },
         get_monitor_scale: () => 1,
     };
     const Main = {
@@ -36,8 +42,14 @@ function fixture() {
         sessionMode: {isLocked: false, isGreeter: false, connect: (_name, callback) => {
             state.modeCallback = callback; return 1;
         }, disconnect() {}},
-        layoutManager: {primaryMonitor: {x: 0, y: 0, width: 1000}, addChrome(label, options) {
-            state.label = label; assert.equal(options.affectsInputRegion, false);
+        layoutManager: {primaryMonitor: {x: 0, y: 0, width: 1000}, addChrome(label, options = {}) {
+            state.label = label;
+            // GNOME 50 layout.js passes these options through strict Params.parse.
+            for (const name of Object.keys(options)) {
+                if (!['affectsStruts', 'trackFullscreen'].includes(name))
+                    throw new Error(`Unrecognized parameter "${name}"`);
+            }
+            if (state.chromeError) throw new Error(state.chromeError);
         }},
     };
     const context = {
@@ -45,7 +57,7 @@ function fixture() {
         Clutter: {ModifierType: {SHIFT_MASK: 1, CONTROL_MASK: 4, MOD1_MASK: 8, SUPER_MASK: 64},
             InputDeviceType: {KEYBOARD_DEVICE: 1}, KeyState: {PRESSED: 1, RELEASED: 0},
             KEY_Control_L: 1, KEY_Shift_L: 2, KEY_v: 3},
-        Meta: {KeyBindingFlags: {IGNORE_AUTOREPEAT: 1}, KeyBindingAction: {NONE: 0},
+        Meta: {KeyBindingFlags: {IGNORE_AUTOREPEAT: 16, TRIGGER_RELEASE: 128}, KeyBindingAction: {NONE: 0},
             external_binding_name_for_action: id => String(id)},
         Shell: {ActionMode: {NORMAL: 1, NONE: 0}, Screenshot: class {
             screenshot_window(frame, cursor, stream, callback) {
@@ -57,9 +69,10 @@ function fixture() {
         }},
         Gio: {
             DBus: {session: {emit_signal: (...args) => emitted.push(args)}},
-            DBusExportedObject: {wrapJSObject: () => ({export() {}, unexport() {state.unexported = true;}})},
+            DBusExportedObject: {wrapJSObject: () => ({export() {state.exported = true;}, unexport() {state.unexported = true;}})},
             BusNameOwnerFlags: {NONE: 0}, BusNameWatcherFlags: {NONE: 0},
-            bus_own_name_on_connection: () => 1, bus_unown_name() {},
+            bus_own_name_on_connection: () => {state.busOwned = true; return 1;},
+            bus_unown_name() {state.busOwned = false;},
             bus_watch_name_on_connection: (_connection, name, _flags, _appeared, vanished) => {
                 watches.set(name, vanished); return name;
             }, bus_unwatch_name: name => watches.delete(name),
@@ -99,7 +112,7 @@ function fixture() {
     };
     vm.runInNewContext(source, context);
     const extension = new context.HexExtension();
-    extension.enable();
+    if (enable) extension.enable();
     function call(method, params, sender = ':fixture.owner') {
         return new Promise((resolve, reject) => extension[`${method}Async`](params, {
             get_sender: () => sender,
@@ -109,6 +122,26 @@ function fixture() {
     }
     return {extension, call, state, display, Main, keys, signals, grabs, watches, emitted};
 }
+
+test('failed GNOME HUD startup releases partial initialization', () => {
+    const f = fixture({enable: false});
+    f.state.chromeError = 'fixture HUD failure';
+    assert.throws(() => f.extension.enable(), /fixture HUD failure/);
+    assert.equal(f.signals.size, 0);
+    assert.equal(f.state.unexported, true);
+    assert.equal(f.state.busOwned, false);
+    assert.equal(f.state.label.destroyed, true);
+    f.extension.disable();
+});
+
+test('GNOME shortcut delivers press and release for hold-to-dictate', async () => {
+    const f = fixture();
+    const [lease] = await f.call('Acquire', ['<Control><Alt>space']);
+    f.display.shortcutEdge(f.extension._shortcut, true);
+    f.display.shortcutEdge(f.extension._shortcut, false);
+    assert.deepEqual(f.emitted.map(signal => Array.from(signal[4].values)),
+        [[lease, true], [lease, false]]);
+});
 
 test('GNOME lease isolates methods and cleans up after owner disappears', async () => {
     const f = fixture();
