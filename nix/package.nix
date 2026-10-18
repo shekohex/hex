@@ -134,6 +134,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
   env = buildEnv;
   # Desktop and installed-model tests are #[ignore]; run the remaining suite.
   doCheck = true;
+  # Fresh executable fixtures can hit ETXTBSY when other tests fork concurrently.
+  checkFlags = [ "--test-threads=1" ];
   nativeCheckInputs = [
     curl
     nodejs

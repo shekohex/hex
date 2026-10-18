@@ -592,6 +592,9 @@ Linux beta                               // not macOS feature parity
 ├── hex start -> Per-user service -> Alt-Space capture -> Transcribe -> Paste
 ├── hex app -> Settings client; closing it leaves the runtime running
 ├── Recording sounds -> Shortcut press / capture stop / active cancellation
+├── Release microphone while idle (opt-in) -> Cold open on shortcut -> Close after capture
+│   └── No pre-roll; start tone signals ready; late/cancelled opens are fenced
+├── Pause media (opt-in) -> Intentional capture -> Hold through cleanup/paste -> Resume owned MPRIS sessions
 ├── X11 -> No tray or recording HUD; service status and sounds remain available
 ├── Wayland -> evdev + compositor protocols; keys observed, not suppressed
 │   └── Mouse-classified nodes excluded; live modifiers reused for paste
@@ -673,6 +676,35 @@ Wire, compatibility, and persistence regressions are in [cloud tests](../../src/
 and [pipeline tests](../../src/linux_pipeline.rs). They cover streaming and ordinary
 requests, omitted defaults, native fields, and invalid budgets, not live-provider
 acceptance or native interaction with the new controls.
+
+Idle release and media pause are independent persisted Linux Behavior settings,
+both off by default. [Microphone ownership](../../src/linux_microphone.rs) bounds
+cold opens to one, fences old generations, and closes without waiting for output.
+[Capture](../../src/linux_dictation.rs) measures cold physical holds independently
+of the new stream's timestamp clock. [Media ownership](../../src/linux_media.rs)
+uses bounded session-bus MPRIS calls off capture, tracks unique player owners and
+track IDs, skips already-paused players, and resumes after output or shutdown.
+Unavailable media support never fails dictation. Only exposed MPRIS sessions are
+supported, not arbitrary browser tabs or remote media-server APIs.
+Fixture checks cover cold release/cancellation and MPRIS pause/resume/track fences;
+the opt-in MPRIS wire test must run inside an isolated `dbus-run-session`, never
+on the user's desktop bus. Service smoke covers persistence and restart.
+
+**Executed October 18, 2026, recording controls:** 260 debug Rust tests passed
+with 14 opt-in checks skipped. Strict all-target Clippy and formatting passed.
+The isolated MPRIS wire test passed separately, including the production worker's
+pause acknowledgement, pending-output ownership, changed-track fence, and shutdown
+resume. Parallel runs hit existing OpenCode executable-fixture `ETXTBSY` races;
+the full suite passed serially, and Nix package checks now use that policy while
+compilation still uses the configured core count. Cold Bluetooth opens wait for
+the bounded media-pause attempt so WirePlumber cannot take pause ownership first.
+
+**Observed October 18, 2026, Soundcore Life Q30:** BlueZ advertised SBC/AAC A2DP
+endpoints and CVSD/mSBC headset profiles. Opening a local, discarded microphone
+probe selected mSBC both before and with temporary `MultiProfile=multiple`;
+closing capture restored AAC/A2DP. Original BlueZ config was restored. This is
+native profile-transition evidence, not subjective playback-quality verification
+or proof of the new toggle's physical shortcut path.
 
 **Executed October 18, 2026, thinking controls:** 257 Rust tests passed in debug
 and the Nix release package (13 ignored), strict all-target Clippy and formatting

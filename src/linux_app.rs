@@ -62,6 +62,8 @@ enum SettingsChange {
     Hotkey(crate::linux_settings::LinuxHotkey),
     DoubleTap(bool),
     PasteWithShift(bool),
+    ReleaseMicrophone(bool),
+    PauseMedia(bool),
     Providers(Box<crate::linux_settings::ProviderConfiguration>),
 }
 
@@ -364,6 +366,12 @@ pub fn run_service(event_path: PathBuf, shutdown: &'static AtomicBool) -> Result
                             host.begin_settings_edit(SettingsChange::PasteWithShift(value))
                         }
                         Request::SetVolume(value) => host.set_sound_effect_volume(value)?,
+                        Request::SetReleaseMicrophone(value) => {
+                            host.begin_settings_edit(SettingsChange::ReleaseMicrophone(value))
+                        }
+                        Request::SetPauseMedia(value) => {
+                            host.begin_settings_edit(SettingsChange::PauseMedia(value))
+                        }
                         Request::ConfigureProviders(configuration) => {
                             configuration.validate()?;
                             if host.settings_edit.is_some()
@@ -857,6 +865,14 @@ impl LinuxDesktopHost {
                         candidate.paste_with_shift = enabled;
                         None
                     }
+                    SettingsChange::ReleaseMicrophone(enabled) => {
+                        candidate.release_microphone_while_idle = enabled;
+                        None
+                    }
+                    SettingsChange::PauseMedia(enabled) => {
+                        candidate.pause_media_while_recording = enabled;
+                        None
+                    }
                     SettingsChange::Providers(configuration) => {
                         candidate.cloud_transcription = configuration.cloud_transcription;
                         candidate.processing = configuration.processing;
@@ -1186,6 +1202,8 @@ impl LinuxApp {
         let double_tap_lock = snapshot.double_tap_lock;
         let editing = self.host.editing_settings();
         let paste_with_shift = self.host.settings.paste_with_shift;
+        let release_microphone = self.host.settings.release_microphone_while_idle;
+        let pause_media = self.host.settings.pause_media_while_recording;
         let sound_volume_busy = editing || snapshot.transcription.preparing.is_some();
         let sound_volume = segmented_control().children(
             crate::desktop_ui::SOUND_VOLUME_STEPS
@@ -1395,6 +1413,34 @@ impl LinuxApp {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if !this.quitting && !editing {
                                                 this.host.set_terminal_paste(!paste_with_shift);
+                                                cx.notify();
+                                            }
+                                        })),
+                                    ).child(
+                                        settings_row(
+                                            "Release microphone while idle",
+                                            "Open on shortcut; restores Bluetooth playback quality between recordings",
+                                            toggle(if release_microphone { 1.0 } else { 0.0 }),
+                                        )
+                                        .id("release-microphone-setting")
+                                        .when(editing, |row| row.opacity(0.5))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this.quitting && !editing {
+                                                let _ = this.host.send(Request::SetReleaseMicrophone(!release_microphone));
+                                                cx.notify();
+                                            }
+                                        })),
+                                    ).child(
+                                        settings_row(
+                                            "Pause media while dictating",
+                                            "Resume paused music/video after transcription and cleanup",
+                                            toggle(if pause_media { 1.0 } else { 0.0 }),
+                                        )
+                                        .id("pause-media-setting")
+                                        .when(editing, |row| row.opacity(0.5))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this.quitting && !editing {
+                                                let _ = this.host.send(Request::SetPauseMedia(!pause_media));
                                                 cx.notify();
                                             }
                                         })),

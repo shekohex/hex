@@ -882,11 +882,18 @@ impl DictationCapture {
     }
 
     pub fn become_intentional(&mut self, now: CaptureInstant) -> bool {
+        let held = self.recording.as_ref().map_or(Duration::ZERO, |recording| {
+            now.duration_since(recording.started_at)
+        });
+        self.become_intentional_after_hold(held)
+    }
+
+    /// Cold opens measure the physical hold independently of a new stream's clock.
+    pub fn become_intentional_after_hold(&mut self, held: Duration) -> bool {
         let Some(recording) = &mut self.recording else {
             return false;
         };
-        let became_intentional = !recording.intentional
-            && now.duration_since(recording.started_at) >= MINIMUM_HOLD_DURATION;
+        let became_intentional = !recording.intentional && held >= MINIMUM_HOLD_DURATION;
         recording.intentional |= became_intentional;
         #[cfg(target_os = "macos")]
         if became_intentional {

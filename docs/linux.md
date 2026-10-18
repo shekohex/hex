@@ -237,6 +237,38 @@ uses `thinking: { "budget": 1024 }`.
 See [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning)
 and [Gemini thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking).
 
+### Microphone And Media
+
+Linux **Settings > Behavior** provides two independent, persisted opt-ins:
+
+- **Release microphone while idle:** no microphone stream at listener startup.
+  Hold the shortcut; opening happens off the capture loop. Wait for the start tone
+  before speaking. Cold capture has no pre-roll. Releasing or cancelling before
+  audio is ready discards that attempt; late opens cannot enter a newer capture.
+  The mic closes after capture, without waiting for transcription/cleanup/paste.
+  Off preserves the default warm microphone and pre-roll.
+- **Pause media while dictating:** after the 300 ms intentional-hold threshold,
+  pause playing MPRIS sessions, including music/video in browsers that expose
+  MPRIS. Keep paused through accepted transcription, cleanup, and paste work;
+  resume when no intentional recording or output remains. Cancellation, failure,
+  and listener shutdown release ownership. Already-paused players are untouched;
+  resume only the same process and unchanged track if it is still paused.
+  With idle release enabled, HEX owns the pause before opening the headset mic,
+  avoiding WirePlumber's independent pause when Bluetooth profiles change.
+  Calls are bounded and off the capture loop; unavailable players cannot fail
+  dictation. Players without MPRIS and remote-server controls are not supported.
+
+Both options default off; Nix initial settings can seed
+`release_microphone_while_idle` and `pause_media_while_recording`.
+These do not force system Bluetooth profiles. WirePlumber normally restores A2DP
+when the last Bluetooth mic stream closes; another recording app can prevent it.
+See [WirePlumber autoswitch](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/settings.html#bluetooth-autoswitch-to-headset-profile).
+
+On the tested Soundcore Life Q30, AAC/SBC A2DP provides playback only, while the
+available hands-free codecs are CVSD and mSBC. Native testing with
+`MultiProfile=multiple` still switched to mSBC when the mic opened; the temporary
+BlueZ override was removed. This option is not a demonstrated duplex-quality fix.
+
 ### Credentials
 
 Keys never enter settings or IPC snapshots. Configure an environment-variable

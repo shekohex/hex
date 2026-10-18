@@ -73,6 +73,10 @@ mod linux_gnome;
 #[cfg(target_os = "linux")]
 mod linux_input;
 #[cfg(target_os = "linux")]
+mod linux_media;
+#[cfg(target_os = "linux")]
+mod linux_microphone;
+#[cfg(target_os = "linux")]
 mod linux_paste;
 #[cfg(target_os = "linux")]
 mod linux_pipeline;

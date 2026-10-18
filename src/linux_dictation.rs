@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
-use crate::audio::{AudioInput, AudioInputEvent, CaptureInstant};
+use crate::audio::{AudioInputEvent, CaptureInstant};
 use crate::dictation::{DictationCapture, Finish};
 use crate::events::{DictationPhase, EventLog, TranscriptPhase, VoiceEvent, VoiceState, now_ms};
 use crate::feedback::{self, Tone};
@@ -109,10 +109,13 @@ pub fn run(
         worker: None,
         unfinished: Default::default(),
     };
-    let input = match device {
-        Some(name) => AudioInput::open_matching(name)?,
-        None => AudioInput::open(&[])?,
-    };
+    let mut input =
+        crate::linux_microphone::Microphone::new(device, settings.release_microphone_while_idle)?;
+    let mut device_name = input
+        .input()
+        .map(|input| input.device_name.clone())
+        .unwrap_or_else(|| "Microphone idle".into());
+    let media = crate::linux_media::MediaController::new(settings.pause_media_while_recording);
     let hotkey_label = settings.dictation_hotkey.label();
     let hotkey = LinuxHotkeyMonitor::start(
         settings.dictation_hotkey,
@@ -220,17 +223,21 @@ pub fn run(
     }));
 
     let mut events = observations;
-    let mut capture = DictationCapture::new(input.sample_rate);
+    let mut capture =
+        DictationCapture::new(input.input().map_or(16_000, |input| input.sample_rate));
+    let mut cold_press: Option<Instant> = None;
+    let mut cold_hold_started: Option<Instant> = None;
+    let mut intentional_capture = false;
     let mut captured_through = CaptureInstant::ZERO;
     let mut pending = 0_usize;
     let mut capture_work = CaptureWork::default();
     events.emit(&VoiceEvent::SessionStarted {
         timestamp_ms: now_ms(),
     })?;
-    emit_state(&mut events, VoiceState::Listening, &input.device_name)?;
+    emit_state(&mut events, VoiceState::Listening, &device_name)?;
     println!(
         "HEX dictation is ready on {}. Hold {} to dictate; Ctrl-C stops.",
-        input.device_name, hotkey_label
+        device_name, hotkey_label
     );
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -239,11 +246,31 @@ pub fn run(
         }
         while let Ok(action) = hotkey.events.try_recv() {
             match action {
-                HotkeyEvent::Start if !capture.is_recording() => {
+                HotkeyEvent::Start if !capture.is_recording() && cold_press.is_none() => {
                     capture_work = CaptureWork::default();
-                    start_capture(&mut capture, captured_through, feedback::play);
+                    cold_hold_started = None;
+                    input.start();
+                    if input.input().is_some() {
+                        start_capture(&mut capture, captured_through, feedback::play);
+                    } else {
+                        cold_press = Some(Instant::now());
+                    }
                     events.dictation(DictationPhase::Started, "")?;
-                    emit_state(&mut events, VoiceState::Dictating, &input.device_name)?;
+                    emit_state(&mut events, VoiceState::Dictating, &device_name)?;
+                }
+                action @ (HotkeyEvent::Finish | HotkeyEvent::Cancel)
+                    if cold_press.take().is_some() =>
+                {
+                    input.idle();
+                    capture_work.control.cancel();
+                    let phase = if matches!(action, HotkeyEvent::Cancel) {
+                        feedback::play(Tone::Cancel);
+                        DictationPhase::Cancelled
+                    } else {
+                        DictationPhase::Discarded
+                    };
+                    events.dictation(phase, "")?;
+                    emit_state(&mut events, active_state(false, pending), &device_name)?;
                 }
                 HotkeyEvent::Finish if capture.is_recording() => {
                     let previous_pending = pending;
@@ -259,15 +286,21 @@ pub fn run(
                     if pending > previous_pending {
                         output.unfinished.push_back(control);
                     }
+                    input.idle();
+                    intentional_capture = false;
+                    cold_hold_started = None;
                     hotkey_status.set_output_pending(pending > 0);
                     emit_state(
                         &mut events,
                         active_state(capture.is_recording(), pending),
-                        &input.device_name,
+                        &device_name,
                     )?;
                 }
                 HotkeyEvent::Cancel if capture.is_recording() => {
                     capture.cancel();
+                    input.idle();
+                    intentional_capture = false;
+                    cold_hold_started = None;
                     capture_work.control.cancel();
                     capture_work = CaptureWork::default();
                     feedback::play(Tone::Cancel);
@@ -275,7 +308,7 @@ pub fn run(
                     emit_state(
                         &mut events,
                         active_state(capture.is_recording(), pending),
-                        &input.device_name,
+                        &device_name,
                     )?;
                 }
                 HotkeyEvent::Cancel if output.unfinished.iter().rev().any(|job| job.cancel()) => {
@@ -309,12 +342,39 @@ pub fn run(
             }
             emit_state(
                 &mut events,
-                active_state(capture.is_recording(), pending),
-                &input.device_name,
+                active_state(capture.is_recording() || cold_press.is_some(), pending),
+                &device_name,
             )?;
         }
 
-        indicator.update(capture.is_recording(), pending);
+        let intentional_cold_press = cold_press
+            .is_some_and(|pressed| pressed.elapsed() >= crate::dictation::MINIMUM_HOLD_DURATION);
+        if let Some(media) = &media {
+            media.update(intentional_capture || intentional_cold_press, pending);
+        }
+        // Own media before a Bluetooth cold open: WirePlumber may otherwise
+        // pause it first when removing the A2DP sink during profile switching.
+        let may_open = cold_press.is_none()
+            || media
+                .as_ref()
+                .is_none_or(|media| intentional_cold_press && media.pause_attempt_finished());
+        match if may_open { input.poll() } else { Ok(false) } {
+            Ok(true) => {
+                let opened = input.input().expect("poll opened a microphone");
+                device_name = opened.device_name.clone();
+                capture = DictationCapture::new(opened.sample_rate);
+                captured_through = CaptureInstant::ZERO;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                cold_press = None;
+                input.idle();
+                capture_work.control.cancel();
+                events.dictation(DictationPhase::Failed(error), "")?;
+                emit_state(&mut events, active_state(false, pending), &device_name)?;
+            }
+        }
+        indicator.update(capture.is_recording() || cold_press.is_some(), pending);
         let chunk = match input.recv_timeout(UPDATE_INTERVAL) {
             AudioInputEvent::Chunk {
                 samples,
@@ -328,8 +388,22 @@ pub fn run(
                 return Err(eyre!("microphone stream stopped: {error}"));
             }
         };
+        if let Some(pressed) = cold_press.take() {
+            let onset =
+                captured_through.sub_frames(chunk.len(), input.input().unwrap().sample_rate);
+            start_capture(&mut capture, onset, feedback::play);
+            cold_hold_started = Some(pressed);
+        }
         capture.ingest(&chunk, captured_through);
-        if capture.become_intentional(captured_through) {
+        let became_intentional = match cold_hold_started {
+            Some(pressed) => capture.become_intentional_after_hold(pressed.elapsed()),
+            None => capture.become_intentional(captured_through),
+        };
+        if became_intentional {
+            intentional_capture = true;
+            if let Some(media) = &media {
+                media.update(true, pending);
+            }
             capture_work.context = Some(crate::linux_context::ContextCapture::start(
                 processing.clone(),
             ));
@@ -351,7 +425,7 @@ pub fn run(
     }
 
     indicator.update(false, pending);
-    emit_state(&mut events, VoiceState::Stopping, &input.device_name)?;
+    emit_state(&mut events, VoiceState::Stopping, &device_name)?;
     output.stop.store(true, Ordering::Release);
     capture_work.control.cancel();
     hotkey_status.set_output_pending(false);
@@ -456,6 +530,18 @@ fn emit_state(events: &mut EventLog, state: VoiceState, device: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_open_uses_physical_hold_not_the_new_stream_clock() {
+        let mut capture = DictationCapture::new(16_000);
+        let audio_end = CaptureInstant::from_nanos(20_000_000);
+        capture.start(CaptureInstant::ZERO);
+        capture.ingest(&vec![0.25; 320], audio_end);
+        assert!(!capture.become_intentional(audio_end));
+        assert!(!capture.become_intentional_after_hold(Duration::from_millis(299)));
+        assert!(capture.become_intentional_after_hold(Duration::from_secs(1)));
+        assert!(capture.would_transcribe(audio_end));
+    }
 
     #[test]
     fn cancellation_wins_until_insertion_commits_and_never_cancels_committed_output() {

@@ -85,6 +85,8 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert state["settings"]["paste_with_shift"] is False
         assert state["settings"]["sound_effect_volume"] == 0.25
         assert state["settings"]["processing"]["default_mode"]["thinking"] == "default"
+        assert state["settings"]["release_microphone_while_idle"] is False
+        assert state["settings"]["pause_media_while_recording"] is False
         assert json.loads((support / "linux-settings.json").read_text()) == state["settings"]
         assert stat.S_IMODE((support / "linux-settings.json").stat().st_mode) == 0o600
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -133,6 +135,11 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
             assert call(client, {"ConfigureProviders": invalid_thinking})["error"]
         assert snapshot()["settings"] == state["settings"]
 
+        for preference in ["SetReleaseMicrophone", "SetPauseMedia"]:
+            with connection() as client:
+                assert call(client, {preference: True})["error"] is None
+            wait_for(lambda: not snapshot()["editing"])
+
         # Disconnecting an uncommitted focused shortcut capture releases only that edit.
         with connection() as client:
             assert call(client, "CaptureShortcut")["state"]["capturing"]
@@ -173,6 +180,8 @@ with tempfile.TemporaryDirectory(prefix="hex-service-", dir=os.environ.get("TMPD
         assert state["settings"]["processing"]["default_mode"]["prompt"] == providers["processing"]["default_mode"]["prompt"]
         assert state["settings"]["processing"]["default_mode"]["context"]["screen"] == "ocr"
         assert state["settings"]["processing"]["default_mode"]["thinking"] == "low"
+        assert state["settings"]["release_microphone_while_idle"] is True
+        assert state["settings"]["pause_media_while_recording"] is True
         subprocess.run([binary, "stop"], env=env, check=True, capture_output=True)
         assert service.wait(timeout=8) == 0
         assert not path.exists()

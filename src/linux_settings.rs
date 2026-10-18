@@ -21,6 +21,8 @@ pub struct LinuxSettings {
     #[serde(default = "legacy_paste_with_shift")]
     pub paste_with_shift: bool,
     pub sound_effect_volume: f32,
+    pub release_microphone_while_idle: bool,
+    pub pause_media_while_recording: bool,
     pub transcription: crate::transcription_models::TranscriptionSelection,
     pub cloud_transcription: Option<crate::cloud::TranscriptionSettings>,
     pub processing: crate::linux_pipeline::PipelineSettings,
@@ -63,6 +65,8 @@ impl Default for LinuxSettings {
             double_tap_lock: true,
             paste_with_shift: false,
             sound_effect_volume: 0.5,
+            release_microphone_while_idle: false,
+            pause_media_while_recording: false,
             transcription: crate::transcription_models::TranscriptionSelection::default(),
             cloud_transcription: None,
             processing: Default::default(),

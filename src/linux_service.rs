@@ -33,6 +33,8 @@ pub enum Request {
     CancelShortcut,
     SetTerminalPaste(bool),
     SetVolume(f32),
+    SetReleaseMicrophone(bool),
+    SetPauseMedia(bool),
     ConfigureProviders(Box<crate::linux_settings::ProviderConfiguration>),
     ChooseModel {
         model: TranscriptionModelId,
