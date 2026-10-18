@@ -390,6 +390,23 @@ impl Render for ProviderEditor {
             .when(self.cloud_enabled, |panel| {
                 panel
                     .children(self.speech_inputs.connection.render())
+                    .when(self.speech.mode == TranscriptionMode::Realtime, |panel| {
+                        let enabled = self.speech.server_vad;
+                        panel.child(
+                            settings_row(
+                                "Server VAD",
+                                "Transcribe during pauses; requires provider support",
+                                toggle(if enabled { 1.0 } else { 0.0 }),
+                            )
+                            .id("speech-server-vad")
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.speech.server_vad = !enabled;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
                     .child(field("Model ID", &self.speech_inputs.model))
                     .child(field("Language", &self.speech_inputs.language))
                     .child(field("Recognition hints", &self.speech_inputs.hints))

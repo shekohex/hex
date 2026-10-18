@@ -646,7 +646,7 @@ fn realtime_sends_audio_before_release_and_commits_exactly_once() {
     };
     let mut session = RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), |_| {});
     let audio = vec![0.25; 16_000];
-    session.offer(&audio[..8000]);
+    session.offer(&audio[..9600]);
     audio_received
         .recv_timeout(Duration::from_secs(3))
         .expect("audio must reach provider before release");
@@ -679,6 +679,8 @@ fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
             .send(Message::text(r#"{"type":"session.updated"}"#))
             .unwrap();
         let mut pcm = Vec::new();
+        let mut packets = 0;
+        let started = std::time::Instant::now();
         loop {
             let message = socket.read().unwrap();
             if !message.is_text() {
@@ -686,11 +688,14 @@ fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
             }
             let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
             match event["type"].as_str().unwrap() {
-                "input_audio_buffer.append" => pcm.extend(
-                    BASE64_STANDARD
-                        .decode(event["audio"].as_str().unwrap())
-                        .unwrap(),
-                ),
+                "input_audio_buffer.append" => {
+                    packets += 1;
+                    pcm.extend(
+                        BASE64_STANDARD
+                            .decode(event["audio"].as_str().unwrap())
+                            .unwrap(),
+                    );
+                }
                 "input_audio_buffer.commit" => {
                     socket
                         .send(Message::text(
@@ -698,7 +703,7 @@ fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
                         ))
                         .unwrap();
                     socket.send(Message::text(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"turn-1","transcript":"All speech retained."}"#)).unwrap();
-                    return pcm;
+                    return (pcm, packets, started.elapsed());
                 }
                 _ => panic!("unexpected event"),
             }
@@ -737,7 +742,15 @@ fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
     // Join even when the regression fails, so the fixture cannot leak a worker.
     let received = worker.join();
     assert_eq!(result.unwrap(), "All speech retained.");
-    let received = received.unwrap();
+    let (received, packets, elapsed) = received.unwrap();
+    assert!(
+        packets <= 7,
+        "20 ms callbacks were not coalesced: {packets} packets"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2400),
+        "setup backlog burst instead of recording-speed delivery: {elapsed:?}"
+    );
     assert_eq!(received.len(), audio.len() * 3);
     for (index, sample) in received.chunks_exact(2).enumerate() {
         let actual = i16::from_le_bytes([sample[0], sample[1]]);
@@ -751,6 +764,7 @@ fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
 }
 
 #[test]
+#[ignore = "121-second recording-speed wire check; run explicitly when changing realtime transport"]
 fn realtime_keeps_commit_order_when_final_transcripts_arrive_in_reverse() {
     use tokio_tungstenite::tungstenite::{Message, accept};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -803,7 +817,7 @@ fn realtime_keeps_commit_order_when_final_transcripts_arrive_in_reverse() {
         .finish(
             &vec![0.25; 16_000 * 121],
             &AtomicBool::new(false),
-            Duration::from_secs(10),
+            Duration::from_secs(140),
         )
         .unwrap();
     assert_eq!(transcript, "First. Second.");
@@ -877,6 +891,7 @@ fn legacy_transcription_settings_default_to_two_retries_and_reject_excessive_cou
     let mut settings: TranscriptionSettings =
         serde_json::from_value(json!({"model": "fixture"})).unwrap();
     assert_eq!(settings.max_retries, 2);
+    assert!(!settings.server_vad);
     settings.max_retries = 0;
     settings.validate().unwrap();
     settings.max_retries = 10;
@@ -930,10 +945,10 @@ fn failed_realtime_uploads_entire_recording_as_batch_instead_of_reconnecting() {
             .collect::<Vec<_>>();
         let mut session =
             RealtimeSession::start(settings.clone(), Arc::new(AtomicBool::new(false)), |_| {});
-        session.offer(&audio[..1600]);
+        session.offer(&audio[..9600]);
         partial_seen.recv_timeout(Duration::from_secs(5)).unwrap();
         // Thirty seconds of capture continue even after the live projection fails.
-        for available in (3200..audio.len()).step_by(1600) {
+        for available in (session.offered_samples() + 1600..audio.len()).step_by(1600) {
             session.offer(&audio[session.offered_samples()..available]);
         }
 
@@ -1317,4 +1332,163 @@ fn batch_backoff_shares_recovery_deadline_and_stream_cancellation_never_uploads_
     assert!(outcome.result.is_err());
     assert_eq!(outcome.retries, 0);
     assert_eq!(worker.join().unwrap().len(), 1);
+}
+
+#[test]
+fn realtime_server_vad_drains_open_turns_and_waits_for_all_final_results() {
+    use tokio_tungstenite::tungstenite::{Message, accept};
+    for open_last_turn in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = accept(stream).unwrap();
+            let update: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(
+                update["session"]["audio"]["input"]["turn_detection"]["type"],
+                "server_vad"
+            );
+            socket
+                .send(Message::text(r#"{"type":"session.updated"}"#))
+                .unwrap();
+            let mut started = false;
+            let mut disabled = false;
+            loop {
+                let message = socket.read().unwrap();
+                if !message.is_text() {
+                    continue;
+                }
+                let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                match event["type"].as_str().unwrap() {
+                    "input_audio_buffer.append" => {
+                        if !started {
+                            started = true;
+                            for event in [
+                                json!({"type":"input_audio_buffer.speech_started", "item_id":"first"}),
+                                json!({"type":"conversation.item.input_audio_transcription.snapshot", "item_id":"first", "transcript":"Provisional"}),
+                                json!({"type":"conversation.item.input_audio_transcription.snapshot", "item_id":"first", "transcript":"Revised draft"}),
+                                json!({"type":"input_audio_buffer.committed", "item_id":"first"}),
+                                json!({"type":"input_audio_buffer.speech_started", "item_id":"second"}),
+                            ] {
+                                socket.send(Message::text(event.to_string())).unwrap();
+                            }
+                            if !open_last_turn {
+                                socket.send(Message::text(json!({"type":"input_audio_buffer.committed", "item_id":"second", "previous_item_id":"first"}).to_string())).unwrap();
+                            }
+                        }
+                    }
+                    "session.update" => {
+                        assert!(
+                            event["session"]["audio"]["input"]
+                                .as_object()
+                                .unwrap()
+                                .contains_key("turn_detection")
+                        );
+                        assert!(event["session"]["audio"]["input"]["turn_detection"].is_null());
+                        disabled = true;
+                        socket
+                            .send(Message::text(r#"{"type":"session.updated"}"#))
+                            .unwrap();
+                        if open_last_turn {
+                            continue;
+                        }
+                        break;
+                    }
+                    "input_audio_buffer.commit" => {
+                        assert!(
+                            disabled && open_last_turn,
+                            "empty or premature manual commit"
+                        );
+                        socket.send(Message::text(json!({"type":"input_audio_buffer.committed", "item_id":"second", "previous_item_id":"first"}).to_string())).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected event"),
+                }
+            }
+            // Earlier automatic turn remains unfinished when the last turn completes.
+            for (id, text) in [("second", "Second."), ("first", "First.")] {
+                socket.send(Message::text(json!({"type":"conversation.item.input_audio_transcription.completed", "item_id":id, "transcript":text}).to_string())).unwrap();
+            }
+            // A commit after an already closed VAD turn would appear here.
+            assert!(matches!(socket.read().unwrap(), Message::Close(_)));
+        });
+        let settings: TranscriptionSettings = serde_json::from_value(json!({
+            "connection": {"base_url":format!("http://{address}/v1"),"api_key_env":""},
+            "model":"fixture", "mode":"realtime", "server_vad":true
+        }))
+        .unwrap();
+        let previews = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = previews.clone();
+        let session =
+            RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), move |text| {
+                observed.lock().unwrap().push(text.to_owned());
+            });
+        let text = session
+            .finish(
+                &vec![0.25; 16_000],
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(text, "First. Second.");
+        let previews = previews.lock().unwrap();
+        assert_eq!(previews[0], "Provisional");
+        assert_eq!(previews[1], "Revised draft");
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "uploads an explicitly supplied synthetic PCM fixture to the configured gateway"]
+fn realtime_configured_gateway_synthetic_probe() {
+    let path = std::env::var("HEX_SYNTHETIC_PCM16_FIXTURE")
+        .expect("supply synthetic mono 16 kHz PCM16, never microphone audio");
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes.len() % 2, 0);
+    let samples = bytes
+        .chunks_exact(2)
+        .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0)
+        .collect::<Vec<_>>();
+    let mut settings = crate::linux_settings::LinuxSettings::load()
+        .unwrap()
+        .cloud_transcription
+        .unwrap();
+    settings.server_vad = true;
+    let updates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = updates.clone();
+    let live_updates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let live_observed = live_updates.clone();
+    let audio_duration = Duration::from_secs_f64(samples.len() as f64 / 16000.0);
+    let started = Instant::now();
+    let session = RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), move |text| {
+        if !text.trim().is_empty() {
+            observed.fetch_add(1, Ordering::Relaxed);
+            if started.elapsed() < audio_duration {
+                live_observed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+    // Direct session: success cannot be hidden by batch fallback.
+    let text = session
+        .finish(&samples, &AtomicBool::new(false), Duration::from_secs(60))
+        .unwrap();
+    assert!(!text.trim().is_empty());
+    assert!(updates.load(Ordering::Relaxed) > 0);
+    assert!(
+        live_updates.load(Ordering::Relaxed) > 0,
+        "fixture must be long enough to observe text before paced audio finishes"
+    );
+    eprintln!(
+        "Synthetic VAD probe: audio={:.2}s elapsed={:.2}s updates={} while_sending={} final_chars={}",
+        samples.len() as f64 / 16000.0,
+        started.elapsed().as_secs_f64(),
+        updates.load(Ordering::Relaxed),
+        live_updates.load(Ordering::Relaxed),
+        text.chars().count()
+    );
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -163,7 +163,9 @@ async fn stream(
                     "audio": {"input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
                         "transcription": transcription,
-                        "turn_detection": null
+                        "turn_detection": if settings.server_vad {
+                            json!({"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500})
+                        } else { Value::Null }
                     }}
                 }
             })
@@ -177,9 +179,18 @@ async fn stream(
                 Some(Ok(Message::Text(data))) => {
                     let event: Value = serde_json::from_str(&data)?;
                     if event["type"] == "error" {
-                        bail!("Realtime session configuration failed");
+                        return Err(provider_error(
+                            &event,
+                            "Realtime session configuration failed",
+                        ));
                     }
                     if event["type"] == "session.updated" {
+                        if let Some(turn_detection) =
+                            event["session"]["audio"]["input"].get("turn_detection")
+                            && settings.server_vad != (turn_detection["type"] == "server_vad")
+                        {
+                            bail!("Provider rejected realtime turn detection settings");
+                        }
                         return Ok(());
                     }
                 }
@@ -204,66 +215,93 @@ async fn stream(
         ))
     })??;
 
+    // Coalesce device callbacks and pace setup backlogs at recording speed.
+    // Some compatible gateways bound their queue by messages, not audio duration.
+    const PACKET_BYTES: usize = 24_000; // 500 ms, PCM16 at 24 kHz
     let mut resampler = Pcm24k::default();
+    let mut pending_pcm = VecDeque::new();
+    let mut next_packet = tokio::time::Instant::now();
     let mut turn_samples = 0;
     let mut expected_commits = 0;
-    let mut turns = Vec::new();
-    let mut transcripts = HashMap::new();
-    let mut finishing = false;
+    let mut transcripts = TranscriptTurns::default();
+    let mut audio_finished = false;
+    let mut stopping_vad = false;
+    let mut active_speech = None;
+    let mut final_commits = None;
     let mut finish_deadline = None;
     loop {
-        if finishing
-            && turns.len() == expected_commits
-            && turns.iter().all(|id| transcripts.contains_key(id))
-        {
-            let text = turns
-                .iter()
-                .filter_map(|id| transcripts.get(id))
-                .cloned()
-                .collect::<Vec<String>>()
-                .join(" ");
-            let _ = socket.close(None).await;
-            return nonempty(text);
+        if let Some(expected) = final_commits {
+            if transcripts.committed.len() > expected {
+                bail!("Unexpected realtime commit");
+            }
+            if transcripts.committed.len() == expected && transcripts.all_completed() {
+                let text = transcripts.final_text();
+                let _ = socket.close(None).await;
+                return nonempty(text);
+            }
         }
         if finish_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             bail!("Realtime final transcript deadline expired");
         }
-        tokio::select! {
-            message = input.recv(), if !finishing => {
-                let (samples, finish) = match message {
-                    Some(AudioMessage::Samples(samples)) => (samples, false),
-                    Some(AudioMessage::Finish(samples)) => (samples, true),
-                    None => bail!("Realtime recording cancelled"),
-                };
-                let mut pcm = resampler.push(&samples);
-                if finish { pcm.extend(resampler.finish()); }
-                // Commit bounded turns while recording; keep finals in commit order.
-                for chunk in pcm.chunks(24_000 * 2 / 10) {
-                    socket.send(Message::Text(json!({
-                        "type": "input_audio_buffer.append",
-                        "audio": BASE64_STANDARD.encode(chunk)
-                    }).to_string().into())).await?;
-                    turn_samples += chunk.len() / 2;
-                    if turn_samples >= 24_000 * 120 {
-                        socket.send(Message::Text(json!({"type":"input_audio_buffer.commit"}).to_string().into())).await?;
-                        expected_commits += 1;
-                        turn_samples = 0;
-                    }
-                }
-                if finish {
-                    // OpenAI requires at least 100 ms in a committed audio buffer.
-                    if turn_samples > 0 && turn_samples < 2400 {
+        if audio_finished && pending_pcm.is_empty() && !stopping_vad && final_commits.is_none() {
+            finish_deadline =
+                Some(tokio::time::Instant::now() + Duration::from_secs(settings.deadline_seconds));
+            if settings.server_vad {
+                // Drain the detector without synthetic silence. Its acknowledgement
+                // follows all automatic commits; only an open speech turn needs commit.
+                socket.send(Message::Text(json!({
+                    "type": "session.update",
+                    "session": {"type": "transcription", "audio": {"input": {"turn_detection": null}}}
+                }).to_string().into())).await?;
+                stopping_vad = true;
+            } else {
+                if turn_samples > 0 {
+                    if turn_samples < 2400 {
                         socket.send(Message::Text(json!({
                             "type": "input_audio_buffer.append",
                             "audio": BASE64_STANDARD.encode(vec![0u8; (2400 - turn_samples) * 2])
                         }).to_string().into())).await?;
                     }
-                    if turn_samples > 0 {
+                    socket
+                        .send(Message::Text(
+                            json!({"type": "input_audio_buffer.commit"})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await?;
+                    expected_commits += 1;
+                }
+                final_commits = Some(expected_commits);
+            }
+        }
+        tokio::select! {
+            message = input.recv(), if !audio_finished && pending_pcm.len() < PACKET_BYTES => {
+                let (samples, finish) = match message {
+                    Some(AudioMessage::Samples(samples)) => (samples, false),
+                    Some(AudioMessage::Finish(samples)) => (samples, true),
+                    None => bail!("Realtime recording cancelled"),
+                };
+                pending_pcm.extend(resampler.push(&samples));
+                if finish {
+                    pending_pcm.extend(resampler.finish());
+                    audio_finished = true;
+                }
+            }
+            _ = tokio::time::sleep_until(next_packet), if pending_pcm.len() >= PACKET_BYTES || (audio_finished && !pending_pcm.is_empty()) => {
+                let count = pending_pcm.len().min(PACKET_BYTES);
+                let packet: Vec<u8> = pending_pcm.drain(..count).collect();
+                socket.send(Message::Text(json!({
+                    "type": "input_audio_buffer.append", "audio": BASE64_STANDARD.encode(&packet)
+                }).to_string().into())).await?;
+                // Never catch up with a burst after a slow send or handshake.
+                next_packet = tokio::time::Instant::now() + Duration::from_secs_f64(count as f64 / 48_000.0);
+                if !settings.server_vad {
+                    turn_samples += count / 2;
+                    if turn_samples >= 24_000 * 120 {
                         socket.send(Message::Text(json!({"type":"input_audio_buffer.commit"}).to_string().into())).await?;
                         expected_commits += 1;
+                        turn_samples = 0;
                     }
-                    finishing = true;
-                    finish_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(settings.deadline_seconds));
                 }
             }
             event = socket.next() => {
@@ -271,23 +309,28 @@ async fn stream(
                     Some(Ok(Message::Text(data))) => {
                         let event: Value = serde_json::from_str(&data)?;
                         match event["type"].as_str() {
-                            Some("error" | "conversation.item.input_audio_transcription.failed") => bail!("Realtime transcription failed"),
+                            Some("error" | "conversation.item.input_audio_transcription.failed") => return Err(provider_error(&event, "Realtime transcription failed")),
+                            Some("input_audio_buffer.speech_started") => {
+                                active_speech = Some(item_id(&event)?.to_owned());
+                            }
                             Some("input_audio_buffer.committed") => {
-                                let id = event["item_id"].as_str().ok_or_else(|| eyre!("Realtime commit has no item ID"))?;
-                                if !turns.iter().any(|previous| previous == id) { turns.push(id.to_owned()); }
-                                if turns.len() > expected_commits { bail!("Unexpected realtime commit"); }
+                                let id = item_id(&event)?;
+                                if active_speech.as_deref() == Some(id) { active_speech = None; }
+                                transcripts.commit(id);
                             }
-                            Some("conversation.item.input_audio_transcription.delta") => {
-                                if let Some(delta) = event["delta"].as_str() { observe(delta); }
-                            }
-                            Some("conversation.item.input_audio_transcription.completed") => {
-                                let id = event["item_id"].as_str().ok_or_else(|| eyre!("Realtime transcript has no item ID"))?;
-                                let text = event["transcript"].as_str().unwrap_or_default().to_owned();
-                                transcripts.insert(id.to_owned(), text);
-                                if transcripts.len() > expected_commits { bail!("Unexpected realtime transcript"); }
-                                if transcripts.values().map(String::len).sum::<usize>() > MAX_RESPONSE_BYTES {
-                                    bail!("Realtime transcript exceeds 2 MiB");
+                            Some("session.updated") if stopping_vad && final_commits.is_none() => {
+                                if event["session"]["audio"]["input"].get("turn_detection").is_some_and(|value| !value.is_null()) {
+                                    continue;
                                 }
+                                let mut expected = transcripts.committed.len();
+                                if active_speech.is_some() {
+                                    socket.send(Message::Text(json!({"type":"input_audio_buffer.commit"}).to_string().into())).await?;
+                                    expected += 1;
+                                }
+                                final_commits = Some(expected);
+                            }
+                            Some("conversation.item.input_audio_transcription.delta" | "conversation.item.input_audio_transcription.snapshot" | "conversation.item.input_audio_transcription.completed") => {
+                                transcripts.update(&event, observe)?;
                             }
                             _ => {}
                         }
@@ -298,8 +341,100 @@ async fn stream(
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)), if finishing => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)), if final_commits.is_some() || stopping_vad => {}
         }
+    }
+}
+
+fn provider_error(event: &Value, description: &str) -> color_eyre::eyre::Report {
+    // Expose diagnostic codes, not provider messages that can echo private input.
+    let code = event["error"]["code"].as_str().unwrap_or_default();
+    if !code.is_empty()
+        && code.len() <= 80
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        eyre!("{description} ({code})")
+    } else {
+        eyre!("{description}")
+    }
+}
+
+fn item_id(event: &Value) -> Result<&str> {
+    event["item_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| eyre!("Realtime event has no item ID"))
+}
+
+#[derive(Default)]
+struct TranscriptTurns {
+    committed: Vec<String>,
+    observed: Vec<String>,
+    text: HashMap<String, (String, bool)>,
+}
+
+impl TranscriptTurns {
+    fn commit(&mut self, id: &str) {
+        if !self.committed.iter().any(|previous| previous == id) {
+            self.committed.push(id.to_owned());
+        }
+    }
+
+    fn update(&mut self, event: &Value, observe: &mut dyn FnMut(&str)) -> Result<()> {
+        let id = item_id(event)?;
+        if !self.text.contains_key(id) {
+            self.observed.push(id.to_owned());
+        }
+        let (text, completed) = self.text.entry(id.to_owned()).or_default();
+        if *completed {
+            return Ok(());
+        }
+        if event["type"] == "conversation.item.input_audio_transcription.delta" {
+            text.push_str(event["delta"].as_str().unwrap_or_default());
+        } else {
+            *text = event["transcript"].as_str().unwrap_or_default().to_owned();
+            *completed = event["type"] == "conversation.item.input_audio_transcription.completed";
+        }
+        if self
+            .text
+            .values()
+            .map(|(text, _)| text.len())
+            .sum::<usize>()
+            > MAX_RESPONSE_BYTES
+        {
+            bail!("Realtime transcript exceeds 2 MiB");
+        }
+        let preview = self
+            .committed
+            .iter()
+            .chain(
+                self.observed
+                    .iter()
+                    .filter(|id| !self.committed.contains(id)),
+            )
+            .filter_map(|id| self.text.get(id))
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        observe(&preview);
+        Ok(())
+    }
+
+    fn all_completed(&self) -> bool {
+        self.committed
+            .iter()
+            .all(|id| self.text.get(id).is_some_and(|(_, completed)| *completed))
+    }
+
+    fn final_text(&self) -> String {
+        self.committed
+            .iter()
+            .filter_map(|id| self.text.get(id))
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 

@@ -520,7 +520,7 @@ pub fn run(
                 capture_work.realtime = Some(crate::cloud::RealtimeSession::start(
                     cloud.clone(),
                     capture_work.control.cancelled.clone(),
-                    |_| {},
+                    indicator.begin_transcript(),
                 ));
             }
         }

@@ -163,6 +163,9 @@ pub fn run(
         let mut gesture = ShortcutGesture::default();
         let mut displayed = u8::MAX;
         let mut last_update = Instant::now();
+        let mut displayed_transcript = String::new();
+        let mut transcript_supported = true;
+        let mut last_transcript_update = Instant::now();
         let result: Result<()> = async {
             loop {
                 if stop.load(Ordering::Acquire) { return Ok(()); }
@@ -172,6 +175,21 @@ pub fn run(
                     status.update_escape_availability(available);
                     displayed = desired;
                     last_update = Instant::now();
+                }
+                if transcript_supported && last_transcript_update.elapsed() >= Duration::from_millis(100) {
+                    let transcript = crate::linux_desktop::live_transcript();
+                    if transcript != displayed_transcript {
+                        match tokio::time::timeout(Duration::from_millis(200), proxy.call::<_, _, ()>("SetTranscript", &(lease, &transcript))).await {
+                            Ok(Ok(())) => displayed_transcript = transcript,
+                            _ => {
+                                // Older Shell modules remain loaded until logout. Never
+                                // break shortcuts because an optional HUD method is absent.
+                                tracing::warn!("Live HUD unavailable: reload the HEX GNOME extension or log out and back in");
+                                transcript_supported = false;
+                            }
+                        }
+                    }
+                    last_transcript_update = Instant::now();
                 }
                 let event = tokio::select! {
                     message = shortcuts.next() => {

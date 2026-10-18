@@ -134,6 +134,7 @@ pub struct TranscriptionSettings {
     pub mode: TranscriptionMode,
     pub deadline_seconds: u64,
     pub max_retries: u8,
+    pub server_vad: bool,
 }
 
 impl Default for TranscriptionSettings {
@@ -146,6 +147,7 @@ impl Default for TranscriptionSettings {
             mode: TranscriptionMode::Batch,
             deadline_seconds: 120,
             max_retries: 2,
+            server_vad: false,
         }
     }
 }

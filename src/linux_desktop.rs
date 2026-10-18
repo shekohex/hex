@@ -12,6 +12,22 @@ use crate::linux_session::LinuxSession;
 
 const TICK: Duration = Duration::from_millis(16);
 
+// Each capture owns a separate cell: late results cannot replace a newer draft.
+static LIVE_TRANSCRIPT: Mutex<Option<Arc<Mutex<String>>>> = Mutex::new(None);
+
+pub(crate) fn live_transcript() -> String {
+    LIVE_TRANSCRIPT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .map(|text| {
+            text.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum IndicatorState {
     #[default]
@@ -128,6 +144,7 @@ pub(crate) fn shutdown() {
 
 pub(crate) struct LinuxIndicator {
     generation: Option<u64>,
+    transcript: Mutex<Option<Arc<Mutex<String>>>>,
 }
 
 impl LinuxIndicator {
@@ -141,9 +158,55 @@ impl LinuxIndicator {
                     .indicator
                     .acquire()
             });
-        Self { generation }
+        Self {
+            generation,
+            transcript: Mutex::new(None),
+        }
     }
+    pub(crate) fn begin_transcript(&self) -> impl FnMut(&str) + Send + 'static {
+        let transcript = Arc::new(Mutex::new(String::new()));
+        *self
+            .transcript
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(transcript.clone());
+        *LIVE_TRANSCRIPT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(transcript.clone());
+        move |text| {
+            let characters: Vec<char> = text.chars().rev().take(120).collect();
+            let mut preview = String::new();
+            for (index, character) in characters.into_iter().rev().enumerate() {
+                if index == 60 {
+                    preview.push('\n');
+                }
+                preview.push(if character.is_whitespace() {
+                    ' '
+                } else {
+                    character
+                });
+            }
+            *transcript.lock().unwrap_or_else(|error| error.into_inner()) = preview;
+        }
+    }
+
     pub(crate) fn update(&self, recording: bool, pending: usize) {
+        if !recording && pending == 0 {
+            let own = self
+                .transcript
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let mut current = LIVE_TRANSCRIPT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if own
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(own, current)| Arc::ptr_eq(own, current))
+            {
+                *current = None;
+            }
+        }
         if crate::linux_gnome::is_gnome() {
             crate::linux_gnome::set_indicator(recording, pending);
             return;
@@ -183,27 +246,35 @@ fn run(state: &Mutex<State>, stop: &AtomicBool) -> Result<()> {
     }
     let context = gtk::glib::MainContext::default();
     let mut displayed = IndicatorState::Hidden;
+    let mut displayed_transcript = String::new();
     while !stop.load(Ordering::Acquire) {
         let desired = state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .indicator
             .state;
-        if desired != displayed {
+        let transcript = live_transcript();
+        if desired != displayed || transcript != displayed_transcript {
             if let Some((window, label)) = &indicator {
                 match desired {
                     IndicatorState::Hidden => window.hide(),
                     IndicatorState::Recording | IndicatorState::Processing => {
-                        label.set_text(if desired == IndicatorState::Recording {
+                        let title = if desired == IndicatorState::Recording {
                             "Recording"
                         } else {
                             "Transcribing"
+                        };
+                        label.set_text(&if transcript.is_empty() {
+                            title.into()
+                        } else {
+                            format!("{title}\n{transcript}")
                         });
                         window.show_all();
                     }
                 }
             }
             displayed = desired;
+            displayed_transcript = transcript;
         }
         for _ in 0..32 {
             if !context.iteration(false) {
@@ -261,6 +332,28 @@ fn create_indicator() -> Result<(gtk::Window, gtk::Label)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_recording_cannot_replace_new_live_hud_text() {
+        let old_indicator = LinuxIndicator {
+            generation: None,
+            transcript: Mutex::new(None),
+        };
+        let new_indicator = LinuxIndicator {
+            generation: None,
+            transcript: Mutex::new(None),
+        };
+        let mut older = old_indicator.begin_transcript();
+        older("Old draft");
+        let mut current = new_indicator.begin_transcript();
+        current("New draft");
+        older("Late old final");
+        old_indicator.update(false, 0);
+        assert_eq!(live_transcript(), "New draft");
+        new_indicator.update(false, 0);
+        current("Late new final");
+        assert!(live_transcript().is_empty());
+    }
+
     #[test]
     fn hud_remains_visible_until_all_output_finishes() {
         assert_eq!(

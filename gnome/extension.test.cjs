@@ -199,3 +199,27 @@ test('locked desktop refuses context and paste; disabling releases resources', a
     assert.equal(f.state.unexported, true);
     assert.equal(f.state.label.destroyed, true);
 });
+
+test('live HUD replaces drafts, stays focus-free, clears on hide and rejects stale or locked updates', async () => {
+    const f = fixture();
+    const [lease] = await f.call('Acquire', ['<Control>space']);
+    await f.call('SetState', [lease, 1]);
+    await f.call('SetTranscript', [lease, 'Draft']);
+    assert.equal(f.state.label.text, 'Recording\nDraft');
+    await f.call('SetTranscript', [lease, 'Revised <draft>']);
+    assert.equal(f.state.label.text, 'Recording\nRevised <draft>');
+    await f.call('SetState', [lease, 2]);
+    assert.equal(f.state.label.text, 'Transcribing\nRevised <draft>');
+    await assert.rejects(f.call('SetTranscript', [lease, 'x'.repeat(513)]), /limit/);
+    await assert.rejects(f.call('SetTranscript', [lease, 'other'], ':other'), /expired/);
+    await f.call('SetState', [lease, 0]);
+    await f.call('SetTranscript', [lease, 'late']);
+    await f.call('SetState', [lease, 1]);
+    assert.equal(f.state.label.text, 'Recording');
+    f.Main.sessionMode.isLocked = true;
+    f.state.modeCallback();
+    assert.equal(f.state.label.text, '');
+    assert.equal(f.state.label.visible, false);
+    await assert.rejects(f.call('SetTranscript', [lease, 'private']), /locked/);
+    f.extension.disable();
+});

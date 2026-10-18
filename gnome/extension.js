@@ -112,6 +112,9 @@ export default class HexExtension extends Extension {
         this._shortcut = 0;
         this._escape = 0;
         this._owner = null;
+        this._state = 0;
+        this._transcript = '';
+        if (this._label) this._label.text = '';
         this._label?.hide();
         if (this._watch)
             Gio.bus_unwatch_name(this._watch);
@@ -147,7 +150,10 @@ export default class HexExtension extends Extension {
     }
 
     _showState(state) {
+        this._state = state;
         if (!state) {
+            this._transcript = '';
+            this._label.text = '';
             this._label.hide();
             this._ungrab(this._escape);
             this._escape = 0;
@@ -155,7 +161,8 @@ export default class HexExtension extends Extension {
         }
         if (!this._escape)
             this._escape = this._grab('Escape');
-        this._label.text = state === 1 ? 'Recording' : 'Transcribing';
+        const title = state === 1 ? 'Recording' : 'Transcribing';
+        this._label.text = this._transcript ? `${title}\n${this._transcript}` : title;
         const monitor = Main.layoutManager.primaryMonitor;
         if (monitor) {
             this._label.show();
@@ -175,6 +182,20 @@ export default class HexExtension extends Extension {
             }
             this._showState(state);
             return [!state || !!this._escape];
+        });
+    }
+
+    SetTranscriptAsync([lease, text], invocation) {
+        this._reply(invocation, '()', () => {
+            this._check(lease, invocation);
+            if (new TextEncoder().encode(text).length > 512)
+                throw new Error('HEX live transcript exceeds its limit');
+            // Ignore late updates after hide, and use plain text, never markup.
+            if (this._state) {
+                this._transcript = text;
+                this._showState(this._state);
+            }
+            return [];
         });
     }
 

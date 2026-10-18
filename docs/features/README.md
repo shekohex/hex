@@ -620,7 +620,11 @@ the service.
 Linux Settings > Models & Processing      // dictate.providers.linux
 ├── Local (default) -> Downloaded model
 ├── Cloud / Stream -> Compatible audio upload, optional response SSE
-└── Realtime -> Intentional capture -> Bounded audio projection -> Commit -> Final
+└── Realtime -> Intentional capture -> Paced 500 ms audio -> Ordered final turns
+    ├── Server VAD (optional, default off) -> Pauses submit turns while capture continues
+    │   └── Release -> Drain real audio -> Disable VAD -> Commit open turn -> Await all finals
+    ├── Live HUD -> Replaceable snapshots / deltas -> Latest 120 characters; never partial paste
+    │   └── GNOME: updated extension must load; older extension keeps state-only HUD
     ├── Temporary queue pressure -> Retain unsent capture suffix -> Retry / drain at release
     ├── Live/stream failure -> Full recording -> Same provider/model, normal batch upload
     │   └── Up to N batch attempts; default 2, configurable 0–10; no WS/SSE retry
@@ -666,6 +670,34 @@ pasted` before correction and passed after it. The six realtime checks, full deb
 suite (263 passed, 16 opt-in checks skipped), strict all-target Clippy, and formatting
 passed on October 18, 2026. These are loopback-fixture checks, not live-gateway or
 physical speech-to-paste proof.
+
+Server VAD and live previews are opt-in/provider-dependent additions in
+[live session](../../src/cloud/realtime.rs), [HUD](../../src/linux_desktop.rs), and
+[GNOME adapter](../../gnome/extension.js). VAD does not end physical capture.
+The stop handshake drains real audio and waits for automatic turns plus any open
+manual commit; completed turns are never committed again. Snapshot revisions
+replace draft text, and late results cannot replace a newer capture's HUD.
+The delayed-setup pacing regression reproduced an 82-message burst for three
+seconds of audio before correction. Wire checks cover paced/coalesced full PCM,
+VAD stop mid-speech/between turns, and reversed final delivery. GNOME mocked checks
+cover preview replacement, lease isolation, byte bounds, hide/lock clearing, and
+focus-free labels. These are not native visual proof. The ignored
+`realtime_configured_gateway_synthetic_probe` requires an explicit generated PCM
+fixture and calls the configured WebSocket directly, without batch recovery;
+it does not capture a microphone or exercise paste.
+Observed October 18, 2026: direct gateway probes with generated speech succeeded
+at 7.2 seconds (four preview updates) and 21.6 seconds (12 updates, eight before
+paced audio finished), with server VAD enabled and no batch recovery. The latter
+finished in 25.95 seconds including connection/setup and audio delivery. These
+prove this gateway's WebSocket path and live event delivery, not native recording,
+HUD appearance, or paste. The 121-second manual-turn ordering wire test is opt-in
+because recording-speed pacing makes it take two minutes; run explicitly after
+transport changes rather than adding that delay to every package build.
+Debug verification: 279 tests passed, 18 opt-in checks skipped; the long ordering
+check passed separately before becoming opt-in. Eight GNOME mocked tests,
+formatting, and strict all-target/all-feature Clippy passed. A final HUD ownership
+regression also passed after fencing an older listener's hide operation.
+
 Realtime connection URLs include `intent=transcription` and the selected `model`;
 gateway routing must happen before the session update. The live-audio wire check
 rejects a missing query model. A separate closed-audio-channel regression checks

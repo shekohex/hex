@@ -3,6 +3,7 @@
     <method name="Acquire"><arg type="s" direction="in"/><arg type="u" direction="out"/></method>
     <method name="Release"><arg type="u" direction="in"/></method>
     <method name="SetState"><arg type="u" direction="in"/><arg type="u" direction="in"/><arg type="b" direction="out"/></method>
+    <method name="SetTranscript"><arg type="u" direction="in"/><arg type="s" direction="in"/></method>
     <method name="ModifiersHeld"><arg type="u" direction="in"/><arg type="b" direction="out"/></method>
     <method name="Paste"><arg type="u" direction="in"/><arg type="s" direction="in"/><arg type="b" direction="in"/></method>
     <method name="Clipboard"><arg type="u" direction="in"/><arg type="s" direction="out"/></method>
