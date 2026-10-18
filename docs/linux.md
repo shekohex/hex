@@ -191,7 +191,9 @@ streaming is not live audio input. Realtime offers **Server VAD** (off by defaul
 enable only when the selected provider/model supports it). VAD transcribes turns
 at speech pauses while recording; it never ends the shortcut capture or pastes
 partial text. At release, HEX drains real audio, disables VAD, waits for its
-acknowledgement, commits only an open speech turn, then awaits every final result.
+acknowledgement, commits only an open speech turn, waits for its commit acknowledgement,
+clears uncommitted leftovers, then awaits the clear acknowledgement and every final
+result. Clear never races ahead of a pending manual commit.
 Without VAD, HEX commits bounded 120-second turns. Uploads split into 120-second
 requests. **Transcription retries (0–10)** defaults to 2 recovery
 attempts. When the first realtime or streaming attempt fails, recovery uploads
@@ -212,7 +214,11 @@ output worker within the configured deadline. Capture never waits for network I/
 and the streaming queue stays bounded. Device callbacks are coalesced into 500 ms
 PCM packets, paced at recording speed even after slow setup or at release. This
 avoids flooding gateways whose queues are bounded by message count. Provider error
-codes (not potentially private error messages) remain visible in failures.
+codes (not potentially private error messages) remain visible in failures. Per-session
+process logs separate connection/setup, release admission, audio drain, and final
+result wait; they contain durations/counts, never audio, context, keys, or transcript
+text. Batch recovery logs the original failed attempt before replacing its error.
+Escape cancellation and listener shutdown have separate diagnostic records.
 
 The click-through recording HUD shows the latest 120 characters of provisional
 realtime text, including append-only deltas and replaceable Parakeet snapshots.

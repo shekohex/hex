@@ -373,6 +373,7 @@ pub fn transcribe_recording(
             tracing::warn!(
                 retry = attempt,
                 limit = settings.max_retries,
+                error = %error,
                 "retrying transcription with full batch upload"
             );
             match upload_transcription(&batch, samples, cancelled, remaining, &mut observe) {

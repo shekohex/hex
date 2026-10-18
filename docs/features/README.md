@@ -622,7 +622,7 @@ Linux Settings > Models & Processing      // dictate.providers.linux
 ├── Cloud / Stream -> Compatible audio upload, optional response SSE
 └── Realtime -> Intentional capture -> Paced 500 ms audio -> Ordered final turns
     ├── Server VAD (optional, default off) -> Pauses submit turns while capture continues
-    │   └── Release -> Drain real audio -> Disable VAD -> Commit open turn -> Await all finals
+    │   └── Release -> Drain -> Disable VAD -> Commit open turn + ACK -> Clear + ACK -> All finals
     ├── Live HUD -> Replaceable snapshots / deltas -> Latest 120 characters; never partial paste
     │   └── GNOME: updated extension must load; older extension keeps state-only HUD
     ├── Temporary queue pressure -> Retain unsent capture suffix -> Retry / drain at release
@@ -675,7 +675,9 @@ Server VAD and live previews are opt-in/provider-dependent additions in
 [live session](../../src/cloud/realtime.rs), [HUD](../../src/linux_desktop.rs), and
 [GNOME adapter](../../gnome/extension.js). VAD does not end physical capture.
 The stop handshake drains real audio and waits for automatic turns plus any open
-manual commit; completed turns are never committed again. Snapshot revisions
+manual commit; completed turns are never committed again. Clearing uncommitted
+leftovers waits for the pending manual commit acknowledgement, and finishing waits
+for the clear acknowledgement as well as every final result. Snapshot revisions
 replace draft text, and late results cannot replace a newer capture's HUD.
 The delayed-setup pacing regression reproduced an 82-message burst for three
 seconds of audio before correction. Wire checks cover paced/coalesced full PCM,
@@ -693,6 +695,26 @@ prove this gateway's WebSocket path and live event delivery, not native recordin
 HUD appearance, or paste. The 121-second manual-turn ordering wire test is opt-in
 because recording-speed pacing makes it take two minutes; run explicitly after
 transport changes rather than adding that delay to every package build.
+October 19 follow-up: the VAD stop fixture reproduced a missing buffer-clear
+handshake, then passed after clear/ack was added behind the manual-commit ack fence.
+Per-session process logs now distinguish connection/setup, release admission, audio
+drain, and final-event wait, preserve initial failure reasons before batch fallback,
+and distinguish Escape cancellation from listener shutdown. These are metadata-only
+logs; existing Settings finalization timing remains end-to-end.
+
+**Unresolved native latency report:** a 13.94-second real recording took 8.33 seconds
+in finalization and 3.95 seconds in cleanup, then pasted successfully without retry.
+Generated speech against the currently configured LAN endpoint did not reproduce
+that delay: 21.6 seconds with pauses finalized in 558 ms; 14 seconds of continuous
+speech had 101 ms of drain and 83 ms of final-event wait. These inputs are not the
+user's recording and do not prove its cause or a latency fix. Original WebSocket
+causes for older fallback attempts were not retained by the old diagnostic logs.
+With the instrumented native service, a subsequent 17.11-second user recording
+completed five VAD turns with no retry: 825 ms finalization, 2,533 ms cleanup,
+163 ms paste, 3,522 ms total. Connection/setup took 14 ms during capture and the
+final-event wait was four milliseconds. This is one successful native capture,
+not proof that the earlier intermittent failure or long wait has been eliminated.
+
 Debug verification: 279 tests passed, 18 opt-in checks skipped; the long ordering
 check passed separately before becoming opt-in. Eight GNOME mocked tests,
 formatting, and strict all-target/all-feature Clippy passed. A final HUD ownership

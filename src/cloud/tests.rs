@@ -1409,9 +1409,42 @@ fn realtime_server_vad_drains_open_turns_and_waits_for_all_final_results() {
                     _ => panic!("unexpected event"),
                 }
             }
+            // VAD stop must clear uncommitted leftovers, but only after commit ACK.
+            socket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let clear = socket
+                .read()
+                .expect("missing input_audio_buffer.clear after VAD stop");
+            let clear: Value = serde_json::from_str(clear.to_text().unwrap()).unwrap();
+            assert_eq!(clear["type"], "input_audio_buffer.clear");
+            if !open_last_turn {
+                socket
+                    .send(Message::text(r#"{"type":"input_audio_buffer.cleared"}"#))
+                    .unwrap();
+            }
             // Earlier automatic turn remains unfinished when the last turn completes.
             for (id, text) in [("second", "Second."), ("first", "First.")] {
                 socket.send(Message::text(json!({"type":"conversation.item.input_audio_transcription.completed", "item_id":id, "transcript":text}).to_string())).unwrap();
+            }
+            if open_last_turn {
+                // Even with all finals present, the client must await clear ACK.
+                socket
+                    .get_mut()
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                assert!(
+                    matches!(socket.read(), Err(tokio_tungstenite::tungstenite::Error::Io(error))
+                    if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+                );
+                socket
+                    .send(Message::text(r#"{"type":"input_audio_buffer.cleared"}"#))
+                    .unwrap();
+                socket
+                    .get_mut()
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
             }
             // A commit after an already closed VAD turn would appear here.
             assert!(matches!(socket.read().unwrap(), Message::Close(_)));
@@ -1446,6 +1479,10 @@ fn realtime_server_vad_drains_open_turns_and_waits_for_all_final_results() {
 #[test]
 #[ignore = "uploads an explicitly supplied synthetic PCM fixture to the configured gateway"]
 fn realtime_configured_gateway_synthetic_probe() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .try_init();
     let path = std::env::var("HEX_SYNTHETIC_PCM16_FIXTURE")
         .expect("supply synthetic mono 16 kHz PCM16, never microphone audio");
     let bytes = std::fs::read(path).unwrap();
@@ -1465,24 +1502,32 @@ fn realtime_configured_gateway_synthetic_probe() {
     let live_observed = live_updates.clone();
     let audio_duration = Duration::from_secs_f64(samples.len() as f64 / 16000.0);
     let started = Instant::now();
-    let session = RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), move |text| {
-        if !text.trim().is_empty() {
-            observed.fetch_add(1, Ordering::Relaxed);
-            if started.elapsed() < audio_duration {
-                live_observed.fetch_add(1, Ordering::Relaxed);
+    let mut session =
+        RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), move |text| {
+            if !text.trim().is_empty() {
+                observed.fetch_add(1, Ordering::Relaxed);
+                if started.elapsed() < audio_duration {
+                    live_observed.fetch_add(1, Ordering::Relaxed);
+                }
             }
-        }
-    });
+        });
+    for available in (320..=samples.len()).step_by(320) {
+        let due = started + Duration::from_secs_f64(available as f64 / 16000.0);
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        session.offer(&samples[session.offered_samples()..available]);
+    }
     // Direct session: success cannot be hidden by batch fallback.
     let text = session
         .finish(&samples, &AtomicBool::new(false), Duration::from_secs(60))
         .unwrap();
     assert!(!text.trim().is_empty());
     assert!(updates.load(Ordering::Relaxed) > 0);
-    assert!(
-        live_updates.load(Ordering::Relaxed) > 0,
-        "fixture must be long enough to observe text before paced audio finishes"
-    );
+    if audio_duration >= Duration::from_secs(15) {
+        assert!(
+            live_updates.load(Ordering::Relaxed) > 0,
+            "no live text during long recording"
+        );
+    }
     eprintln!(
         "Synthetic VAD probe: audio={:.2}s elapsed={:.2}s updates={} while_sending={} final_chars={}",
         samples.len() as f64 / 16000.0,

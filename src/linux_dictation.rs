@@ -387,6 +387,7 @@ pub fn run(
                     )?;
                 }
                 HotkeyEvent::Cancel if capture.is_recording() => {
+                    tracing::info!("dictation capture cancelled by Escape");
                     capture.cancel();
                     input.idle();
                     intentional_capture = false;
@@ -402,6 +403,7 @@ pub fn run(
                     )?;
                 }
                 HotkeyEvent::Cancel if output.unfinished.iter().rev().any(|job| job.cancel()) => {
+                    tracing::info!("unfinished dictation cancelled by Escape");
                     feedback::play(Tone::Cancel);
                 }
                 _ => {}
@@ -529,6 +531,7 @@ pub fn run(
         }
     }
 
+    tracing::info!(unfinished = pending, "dictation listener stopping");
     indicator.update(false, pending);
     emit_state(&mut events, VoiceState::Stopping, &device_name)?;
     output.stop.store(true, Ordering::Release);

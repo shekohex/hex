@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -15,6 +15,8 @@ use tokio_tungstenite::tungstenite::{
 
 use super::{MAX_RESPONSE_BYTES, TranscriptionSettings, cancellation, nonempty, run_cancellable};
 
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
 enum AudioMessage {
     Samples(Vec<f32>),
     Finish(Vec<f32>),
@@ -26,6 +28,7 @@ pub struct RealtimeSession {
     result: Receiver<Result<String, String>>,
     cancelled: Arc<AtomicBool>,
     offered_samples: usize,
+    trace_id: u64,
 }
 
 impl RealtimeSession {
@@ -34,11 +37,14 @@ impl RealtimeSession {
         shutdown: Arc<AtomicBool>,
         mut observe: impl FnMut(&str) + Send + 'static,
     ) -> Self {
+        let trace_id = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
         let (audio, input) = channel(64);
         let (sender, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         std::thread::spawn(move || {
+            let span = tracing::info_span!("realtime", session = trace_id);
+            let _entered = span.enter();
             let result = (|| -> Result<String> {
                 tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
                     tokio::select! {
@@ -49,7 +55,10 @@ impl RealtimeSession {
                     }
                 })
             })()
-            .map_err(|error| error.to_string());
+            .map_err(|error| {
+                tracing::warn!(error = %error, "realtime attempt failed");
+                error.to_string()
+            });
             let _ = sender.try_send(result);
         });
         Self {
@@ -57,6 +66,7 @@ impl RealtimeSession {
             result,
             cancelled,
             offered_samples: 0,
+            trace_id,
         }
     }
 
@@ -86,11 +96,23 @@ impl RealtimeSession {
             bail!("Realtime capture boundary changed; nothing pasted");
         }
         let tail = samples[self.offered_samples..].to_vec();
+        tracing::info!(
+            session = self.trace_id,
+            audio_ms = samples.len() / 16,
+            unsent_tail_ms = tail.len() / 16,
+            "realtime release received"
+        );
         let audio = self.audio.clone();
         run_cancellable(shutdown, deadline, async {
             // Closed input means the worker exited; read its result rather than
             // hiding the connection/setup failure behind an audio-queue error.
+            let queued = std::time::Instant::now();
             let _ = audio.send(AudioMessage::Finish(tail)).await;
+            tracing::info!(
+                session = self.trace_id,
+                queue_ms = queued.elapsed().as_millis() as u64,
+                "realtime finish admitted"
+            );
             loop {
                 match self.result.try_recv() {
                     Ok(result) => return result.map_err(|error| eyre!(error)),
@@ -132,6 +154,7 @@ async fn stream(
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_RESPONSE_BYTES))
         .max_frame_size(Some(MAX_RESPONSE_BYTES));
+    let connecting = std::time::Instant::now();
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async_with_config(request, Some(config), false),
@@ -143,6 +166,8 @@ async fn stream(
             "Realtime connection timed out"
         ))
     })??;
+    let connect_ms = connecting.elapsed().as_millis() as u64;
+    let configuring = std::time::Instant::now();
     let mut transcription = json!({"model": settings.model});
     if !settings.language.is_empty() {
         if super::uses_language_list(&settings.model) {
@@ -215,6 +240,13 @@ async fn stream(
         ))
     })??;
 
+    tracing::info!(
+        connect_ms,
+        setup_ms = configuring.elapsed().as_millis() as u64,
+        server_vad = settings.server_vad,
+        "realtime session ready"
+    );
+
     // Coalesce device callbacks and pace setup backlogs at recording speed.
     // Some compatible gateways bound their queue by messages, not audio duration.
     const PACKET_BYTES: usize = 24_000; // 500 ms, PCM16 at 24 kHz
@@ -229,13 +261,40 @@ async fn stream(
     let mut active_speech = None;
     let mut final_commits = None;
     let mut finish_deadline = None;
+    let mut sent_samples = 0usize;
+    let mut draining_started = None;
+    let mut finalizing_started = None;
+    let mut clear_requested = false;
+    let mut cleared = false;
     loop {
         if let Some(expected) = final_commits {
             if transcripts.committed.len() > expected {
                 bail!("Unexpected realtime commit");
             }
-            if transcripts.committed.len() == expected && transcripts.all_completed() {
+            if settings.server_vad && transcripts.committed.len() == expected && !clear_requested {
+                // Clearing before the manual commit ACK can cancel its inference.
+                // Afterwards it discards only uncommitted non-speech leftovers.
+                socket
+                    .send(Message::Text(
+                        json!({"type": "input_audio_buffer.clear"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await?;
+                clear_requested = true;
+            }
+            if transcripts.committed.len() == expected
+                && transcripts.all_completed()
+                && (!settings.server_vad || cleared)
+            {
                 let text = transcripts.final_text();
+                tracing::info!(
+                    turns = expected,
+                    final_wait_ms = finalizing_started
+                        .map_or(0, |start: std::time::Instant| start.elapsed().as_millis()
+                            as u64),
+                    "realtime final results received"
+                );
                 let _ = socket.close(None).await;
                 return nonempty(text);
             }
@@ -244,6 +303,16 @@ async fn stream(
             bail!("Realtime final transcript deadline expired");
         }
         if audio_finished && pending_pcm.is_empty() && !stopping_vad && final_commits.is_none() {
+            tracing::info!(
+                drain_ms = draining_started
+                    .map_or(0, |start: std::time::Instant| start.elapsed().as_millis()
+                        as u64),
+                sent_audio_ms = sent_samples / 24,
+                committed_turns = transcripts.committed.len(),
+                pending_speech = active_speech.is_some(),
+                "realtime audio drained"
+            );
+            finalizing_started = Some(std::time::Instant::now());
             finish_deadline =
                 Some(tokio::time::Instant::now() + Duration::from_secs(settings.deadline_seconds));
             if settings.server_vad {
@@ -285,6 +354,7 @@ async fn stream(
                 if finish {
                     pending_pcm.extend(resampler.finish());
                     audio_finished = true;
+                    draining_started = Some(std::time::Instant::now());
                 }
             }
             _ = tokio::time::sleep_until(next_packet), if pending_pcm.len() >= PACKET_BYTES || (audio_finished && !pending_pcm.is_empty()) => {
@@ -293,6 +363,7 @@ async fn stream(
                 socket.send(Message::Text(json!({
                     "type": "input_audio_buffer.append", "audio": BASE64_STANDARD.encode(&packet)
                 }).to_string().into())).await?;
+                sent_samples += count / 2;
                 // Never catch up with a burst after a slow send or handshake.
                 next_packet = tokio::time::Instant::now() + Duration::from_secs_f64(count as f64 / 48_000.0);
                 if !settings.server_vad {
@@ -310,6 +381,7 @@ async fn stream(
                         let event: Value = serde_json::from_str(&data)?;
                         match event["type"].as_str() {
                             Some("error" | "conversation.item.input_audio_transcription.failed") => return Err(provider_error(&event, "Realtime transcription failed")),
+                            Some("input_audio_buffer.cleared") if clear_requested => cleared = true,
                             Some("input_audio_buffer.speech_started") => {
                                 active_speech = Some(item_id(&event)?.to_owned());
                             }
@@ -494,6 +566,7 @@ mod tests {
             result,
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
+            trace_id: 0,
         };
         let samples = (0..3200)
             .map(|index| index as f32 / 3200.0)
@@ -526,6 +599,7 @@ mod tests {
             result,
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
+            trace_id: 0,
         };
         session.offer(&[0.25; 1600]);
         let error = session
