@@ -690,6 +690,21 @@ Fixture checks cover cold release/cancellation and MPRIS pause/resume/track fenc
 the opt-in MPRIS wire test must run inside an isolated `dbus-run-session`, never
 on the user's desktop bus. Service smoke covers persistence and restart.
 
+An active Linux capture with no PCM callbacks for five seconds now fails with a
+microphone recovery error instead of later discarding a truncated, silent clip.
+Digital silence still counts as delivered audio; the watchdog does not require
+speech. `stalled_capture_reports_failure_instead_of_silent_timeouts` and
+`delivered_audio_resets_stall_deadline` cover this distinction.
+The opt-in `native_cold_microphone_preserves_repeated_captures` and
+`native_warm_microphone_preserves_repeated_captures` checks open the real default
+microphone and discard all samples, exercising capture/resampling without a
+provider or paste. They require a working, non-muted input and can interrupt
+Bluetooth playback. WirePlumber 0.5.17 has an
+[upstream Bluetooth profile-switch regression](https://bugs.debian.org/1148124)
+that can stall HFP capture; 0.5.18 contains the profile-restore fixes. Keeping the
+microphone warm avoids repeated idle profile switches but does not repair an
+already-failed Bluetooth transport.
+
 **Executed October 18, 2026, recording controls:** 260 debug Rust tests passed
 with 14 opt-in checks skipped. Strict all-target Clippy and formatting passed.
 The isolated MPRIS wire test passed separately, including the production worker's
