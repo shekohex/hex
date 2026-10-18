@@ -26,7 +26,6 @@ pub struct RealtimeSession {
     result: Receiver<Result<String, String>>,
     cancelled: Arc<AtomicBool>,
     offered_samples: usize,
-    admission_failed: bool,
 }
 
 impl RealtimeSession {
@@ -58,23 +57,16 @@ impl RealtimeSession {
             result,
             cancelled,
             offered_samples: 0,
-            admission_failed: false,
         }
     }
 
     pub fn offer(&mut self, samples: &[f32]) {
-        if self.admission_failed {
-            return;
-        }
         for chunk in samples.chunks(1600) {
             match self.audio.try_send(AudioMessage::Samples(chunk.to_vec())) {
                 Ok(()) => self.offered_samples += chunk.len(),
-                Err(TrySendError::Closed(_)) => return,
-                Err(TrySendError::Full(_)) => {
-                    self.admission_failed = true;
-                    self.cancelled.store(true, Ordering::Release);
-                    return;
-                }
+                // Capture retains the unaccepted suffix. Retry on the next
+                // callback, or drain it in finish on the output worker.
+                Err(TrySendError::Closed(_) | TrySendError::Full(_)) => return,
             }
         }
     }
@@ -90,9 +82,6 @@ impl RealtimeSession {
         shutdown: &AtomicBool,
         deadline: Duration,
     ) -> Result<String> {
-        if self.admission_failed {
-            bail!("Realtime audio queue overflowed; nothing pasted");
-        }
         if samples.len() < self.offered_samples {
             bail!("Realtime capture boundary changed; nothing pasted");
         }
@@ -348,29 +337,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn realtime_queue_pressure_cancels_instead_of_dropping_audio() {
-        let (audio, _input) = channel(1);
+    fn realtime_queue_pressure_defers_audio_for_retry_without_cancelling() {
+        let (audio, mut input) = channel(1);
         let (_sender, result) = mpsc::sync_channel(1);
         let mut session = RealtimeSession {
             audio,
             result,
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
-            admission_failed: false,
         };
-        session.offer(&vec![0.25; 3200]);
-        assert!(session.cancelled.load(Ordering::Acquire));
-        assert!(
-            session
-                .finish(
-                    &vec![0.25; 3200],
-                    &AtomicBool::new(false),
-                    Duration::from_secs(1)
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("queue overflowed")
-        );
+        let samples = (0..3200)
+            .map(|index| index as f32 / 3200.0)
+            .collect::<Vec<_>>();
+        session.offer(&samples);
+        assert_eq!(session.offered_samples(), 1600);
+        assert!(!session.cancelled.load(Ordering::Acquire));
+        let AudioMessage::Samples(first) = input.try_recv().unwrap() else {
+            panic!("expected audio")
+        };
+        assert_eq!(first, samples[..1600]);
+        session.offer(&samples[session.offered_samples()..]);
+        let AudioMessage::Samples(second) = input.try_recv().unwrap() else {
+            panic!("expected audio")
+        };
+        assert_eq!(second, samples[1600..]);
+        assert_eq!(session.offered_samples(), samples.len());
     }
 
     #[test]
@@ -386,7 +377,6 @@ mod tests {
             result,
             cancelled: Arc::new(AtomicBool::new(false)),
             offered_samples: 0,
-            admission_failed: false,
         };
         session.offer(&[0.25; 1600]);
         let error = session

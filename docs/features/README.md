@@ -621,7 +621,8 @@ Linux Settings > Models & Processing      // dictate.providers.linux
 ├── Local (default) -> Downloaded model
 ├── Cloud / Stream -> Compatible audio upload, optional response SSE
 └── Realtime -> Intentional capture -> Bounded audio projection -> Commit -> Final
-    └── Failure / overflow / missing final -> No partial paste
+    ├── Temporary queue pressure -> Retain unsent capture suffix -> Retry / drain at release
+    └── Failure / missing final -> No partial paste
 
 Processing Modes                         // modes.providers.linux
 ├── Application match -> Mode replaces Global
@@ -651,8 +652,18 @@ Sources: [provider protocols](../../src/cloud.rs),
 [Wire tests](../../src/cloud/tests.rs) cover multipart PCM, three native cleanup
 formats, SSE framing/finalization, cancellation, live WebSocket audio, and
 OCR-mode image exclusion. Live PCM checks compare the emitted prefix against
-the final unpadded clip at 16/44.1/48 kHz; realtime checks reject queue pressure
-and retain commit order when final transcripts arrive reversed.
+the final unpadded clip at 16/44.1/48 kHz; realtime checks preserve the unaccepted
+suffix under bounded queue pressure and retain commit order when final transcripts
+arrive reversed. A delayed-setup WebSocket regression fills the queue with 20 ms
+capture deliveries, then verifies the entire ordered PCM ramp and one final result.
+Queue pressure no longer cancels a recording: capture retries its retained suffix,
+and the output worker drains any remainder at release under the existing deadline.
+Queue capacity remains fixed; network waits stay off the capture thread.
+The delayed-setup regression failed with `Realtime audio queue overflowed; nothing
+pasted` before correction and passed after it. The six realtime checks, full debug
+suite (263 passed, 16 opt-in checks skipped), strict all-target Clippy, and formatting
+passed on October 18, 2026. These are loopback-fixture checks, not live-gateway or
+physical speech-to-paste proof.
 Realtime connection URLs include `intent=transcription` and the selected `model`;
 gateway routing must happen before the session update. The live-audio wire check
 rejects a missing query model. A separate closed-audio-channel regression checks

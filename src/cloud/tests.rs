@@ -660,6 +660,97 @@ fn realtime_sends_audio_before_release_and_commits_exactly_once() {
 }
 
 #[test]
+fn realtime_slow_setup_preserves_fragmented_capture_without_blocking() {
+    use tokio_tungstenite::tungstenite::{Message, accept};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (setup_seen, setup_received) = mpsc::sync_channel(1);
+    let (allow_setup, setup_allowed) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut socket = accept(stream).unwrap();
+        socket.read().unwrap();
+        setup_seen.send(()).unwrap();
+        setup_allowed.recv_timeout(Duration::from_secs(5)).unwrap();
+        socket
+            .send(Message::text(r#"{"type":"session.updated"}"#))
+            .unwrap();
+        let mut pcm = Vec::new();
+        loop {
+            let message = socket.read().unwrap();
+            if !message.is_text() {
+                continue;
+            }
+            let event: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            match event["type"].as_str().unwrap() {
+                "input_audio_buffer.append" => pcm.extend(
+                    BASE64_STANDARD
+                        .decode(event["audio"].as_str().unwrap())
+                        .unwrap(),
+                ),
+                "input_audio_buffer.commit" => {
+                    socket
+                        .send(Message::text(
+                            r#"{"type":"input_audio_buffer.committed","item_id":"turn-1"}"#,
+                        ))
+                        .unwrap();
+                    socket.send(Message::text(r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"turn-1","transcript":"All speech retained."}"#)).unwrap();
+                    return pcm;
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+    });
+    let settings = TranscriptionSettings {
+        connection: ConnectionSettings {
+            base_url: format!("http://{address}/v1"),
+            api_key_env: String::new(),
+            api_key_file: None,
+        },
+        model: "fixture-transcription".into(),
+        mode: TranscriptionMode::Realtime,
+        ..Default::default()
+    };
+    let mut session = RealtimeSession::start(settings, Arc::new(AtomicBool::new(false)), |_| {});
+    setup_received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let audio = (0..48_000)
+        .map(|index| index as f32 / 48_000.0 - 0.5)
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    // Match production: each callback reoffers the unaccepted capture suffix.
+    for available in (320..=audio.len()).step_by(320) {
+        session.offer(&audio[session.offered_samples()..available]);
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "capture waited on setup"
+    );
+    assert!(
+        session.offered_samples() < audio.len(),
+        "fixture must fill the bounded queue"
+    );
+    allow_setup.send(()).unwrap();
+    let result = session.finish(&audio, &AtomicBool::new(false), Duration::from_secs(5));
+    // Join even when the regression fails, so the fixture cannot leak a worker.
+    let received = worker.join();
+    assert_eq!(result.unwrap(), "All speech retained.");
+    let received = received.unwrap();
+    assert_eq!(received.len(), audio.len() * 3);
+    for (index, sample) in received.chunks_exact(2).enumerate() {
+        let actual = i16::from_le_bytes([sample[0], sample[1]]);
+        let position = (index as f64 * 2.0 / 3.0).min((audio.len() - 1) as f64);
+        let expected = ((position / 48_000.0 - 0.5) * f64::from(i16::MAX)) as i16;
+        assert!(
+            (i32::from(actual) - i32::from(expected)).abs() <= 1,
+            "PCM changed at sample {index}"
+        );
+    }
+}
+
+#[test]
 fn realtime_keeps_commit_order_when_final_transcripts_arrive_in_reverse() {
     use tokio_tungstenite::tungstenite::{Message, accept};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

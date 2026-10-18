@@ -189,8 +189,12 @@ Enter API base URL and exact model ID. Transcription needs the provider's
 Chat Completions compatibility alone does not imply either exists. File-response
 streaming is not live audio input. Realtime disables server turn detection: the
 shortcut controls finalization. Uploads split into 120-second requests; realtime
-commits bounded turns. Disconnects, queue pressure, and missing final acknowledgments
+commits bounded turns. Disconnects and missing final acknowledgments
 fail without pasting partial text. No automatic provider/local fallback.
+Temporary realtime queue pressure defers unsent audio in the authoritative capture;
+subsequent callbacks retry it, and release drains the remaining suffix on the
+output worker within the configured deadline. Capture never waits for network I/O,
+and the streaming queue stays bounded.
 Realtime includes the selected model in both the WebSocket query and session
 configuration, so gateways can route before receiving `session.update`. Closed
 connections preserve their worker error instead of being reported as queue pressure.
