@@ -396,8 +396,9 @@ fn incomplete_streams_never_become_successful_cleanup() {
 }
 
 #[test]
+#[allow(clippy::result_large_err)] // tungstenite fixes the handshake callback's error type.
 fn realtime_sends_audio_before_release_and_commits_exactly_once() {
-    use tokio_tungstenite::tungstenite::{Message, accept};
+    use tokio_tungstenite::tungstenite::{Message, accept_hdr};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (audio_seen, audio_received) = mpsc::sync_channel(1);
@@ -406,7 +407,26 @@ fn realtime_sends_audio_before_release_and_commits_exactly_once() {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut socket = accept(stream).unwrap();
+        let mut socket = accept_hdr(
+            stream,
+            |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                let url = reqwest::Url::parse(&format!("http://fixture{}", request.uri())).unwrap();
+                assert_eq!(url.path(), "/v1/realtime");
+                let query = url
+                    .query_pairs()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(
+                    query.get("intent").map(|value| value.as_ref()),
+                    Some("transcription")
+                );
+                assert_eq!(
+                    query.get("model").map(|value| value.as_ref()),
+                    Some("gpt-live-transcribe")
+                );
+                Ok(response)
+            },
+        )
+        .unwrap();
         let update: Value =
             serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
         assert_eq!(update["session"]["audio"]["input"]["format"]["rate"], 24000);

@@ -191,6 +191,9 @@ streaming is not live audio input. Realtime disables server turn detection: the
 shortcut controls finalization. Uploads split into 120-second requests; realtime
 commits bounded turns. Disconnects, queue pressure, and missing final acknowledgments
 fail without pasting partial text. No automatic provider/local fallback.
+Realtime includes the selected model in both the WebSocket query and session
+configuration, so gateways can route before receiving `session.update`. Closed
+connections preserve their worker error instead of being reported as queue pressure.
 Language hints use the current OpenAI models' `languages` list; legacy and other
 compatible models keep the singular `language` contract. See the
 [OpenAI transcription contract](https://developers.openai.com/api/docs/guides/transcription).

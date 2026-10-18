@@ -8,7 +8,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use color_eyre::eyre::{Result, bail, eyre};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::sync::mpsc::{Sender, channel, error::TrySendError};
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
@@ -67,16 +67,15 @@ impl RealtimeSession {
             return;
         }
         for chunk in samples.chunks(1600) {
-            if self
-                .audio
-                .try_send(AudioMessage::Samples(chunk.to_vec()))
-                .is_err()
-            {
-                self.admission_failed = true;
-                self.cancelled.store(true, Ordering::Release);
-                return;
+            match self.audio.try_send(AudioMessage::Samples(chunk.to_vec())) {
+                Ok(()) => self.offered_samples += chunk.len(),
+                Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(_)) => {
+                    self.admission_failed = true;
+                    self.cancelled.store(true, Ordering::Release);
+                    return;
+                }
             }
-            self.offered_samples += chunk.len();
         }
     }
 
@@ -92,7 +91,7 @@ impl RealtimeSession {
         deadline: Duration,
     ) -> Result<String> {
         if self.admission_failed {
-            bail!("Realtime audio queue overflowed or connection failed; nothing pasted");
+            bail!("Realtime audio queue overflowed; nothing pasted");
         }
         if samples.len() < self.offered_samples {
             bail!("Realtime capture boundary changed; nothing pasted");
@@ -100,10 +99,9 @@ impl RealtimeSession {
         let tail = samples[self.offered_samples..].to_vec();
         let audio = self.audio.clone();
         run_cancellable(shutdown, deadline, async {
-            audio
-                .send(AudioMessage::Finish(tail))
-                .await
-                .map_err(|_| eyre!("Realtime connection closed"))?;
+            // Closed input means the worker exited; read its result rather than
+            // hiding the connection/setup failure behind an audio-queue error.
+            let _ = audio.send(AudioMessage::Finish(tail)).await;
             loop {
                 match self.result.try_recv() {
                     Ok(result) => return result.map_err(|error| eyre!(error)),
@@ -132,7 +130,9 @@ async fn stream(
     let mut url = settings.connection.endpoint("realtime")?;
     url.set_scheme(if url.scheme() == "https" { "wss" } else { "ws" })
         .map_err(|_| eyre!("Invalid realtime endpoint"))?;
-    url.query_pairs_mut().append_pair("intent", "transcription");
+    url.query_pairs_mut()
+        .append_pair("intent", "transcription")
+        .append_pair("model", &settings.model);
     let mut request = url.as_str().into_client_request()?;
     let key = settings.connection.api_key()?;
     if !key.is_empty() {
@@ -371,6 +371,32 @@ mod tests {
                 .to_string()
                 .contains("queue overflowed")
         );
+    }
+
+    #[test]
+    fn realtime_connection_failure_preserves_worker_error_instead_of_claiming_queue_pressure() {
+        let (audio, input) = channel(1);
+        let (sender, result) = mpsc::sync_channel(1);
+        drop(input);
+        sender
+            .send(Err("Realtime session configuration failed".into()))
+            .unwrap();
+        let mut session = RealtimeSession {
+            audio,
+            result,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            offered_samples: 0,
+            admission_failed: false,
+        };
+        session.offer(&[0.25; 1600]);
+        let error = session
+            .finish(
+                &[0.25; 1600],
+                &AtomicBool::new(false),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Realtime session configuration failed");
     }
 
     #[test]

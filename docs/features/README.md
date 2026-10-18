@@ -648,6 +648,14 @@ formats, SSE framing/finalization, cancellation, live WebSocket audio, and
 OCR-mode image exclusion. Live PCM checks compare the emitted prefix against
 the final unpadded clip at 16/44.1/48 kHz; realtime checks reject queue pressure
 and retain commit order when final transcripts arrive reversed.
+Realtime connection URLs include `intent=transcription` and the selected `model`;
+gateway routing must happen before the session update. The live-audio wire check
+rejects a missing query model. A separate closed-audio-channel regression checks
+that the worker's connection/setup error survives instead of becoming a false
+queue-overflow message. Both checks failed before correction. An authenticated
+gateway probe, without audio, failed with its default-model routing before the
+query change and received `session.updated` with the selected-model query. This
+establishes routing/session setup, not live transcription or paste.
 Helper checks bound pipes; opt-in Tesseract checks
 synthetic pixels only. These are not live provider, physical capture/paste,
 desktop Accessibility, or screen-OCR-quality proof. OpenCode accepts OCR text,
@@ -687,7 +695,11 @@ signal, and actor resources on failure. Accelerator grabs explicitly request
 `TRIGGER_RELEASE`; otherwise Mutter delivers presses but not releases, leaving
 hold-to-dictate captures unfinished. Existing observations showed recording
 starts without completion. Native-keypress verification of the corrected build
-still requires a new GNOME login because extension modules are cached.
+requires a new GNOME login because extension modules are cached. After login on
+GNOME 50.4, the corrected extension was ACTIVE without errors. A shortcut-only
+probe received physical press/release; the running Rust listener then observed
+`started` followed by `discarded` for a short tap. These checks establish native
+shortcut/capture delivery without inference, not provider transcription or paste.
 
 `node --test gnome/extension.test.cjs` reproduced both failures with strict
 GNOME-50 chrome options and release-flag-aware accelerator mocks, then passed
