@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use color_eyre::eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 
-use crate::{events::DictationTimings, linux_context::CaptureContext};
+use crate::{
+    events::DictationTimings,
+    linux_context::{CaptureContext, ContextCapture},
+};
 
 const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
@@ -23,7 +26,18 @@ pub struct Snapshot {
 pub struct Recording {
     pub samples: Arc<Vec<f32>>,
     pub raw: Option<String>,
-    pub context: Arc<CaptureContext>,
+    context: Arc<CaptureContext>,
+    pending_context: Option<ContextCapture>,
+}
+
+impl Recording {
+    /// Resolve only on the output worker, never on capture or IPC threads.
+    pub fn context(&self) -> Arc<CaptureContext> {
+        self.pending_context
+            .as_ref()
+            .map(ContextCapture::take)
+            .unwrap_or_else(|| self.context.clone())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +51,7 @@ struct Retained {
     audio: Option<Arc<Vec<f32>>>,
     raw: Option<String>,
     context: Arc<CaptureContext>,
+    pending_context: Option<ContextCapture>,
 }
 
 #[derive(Default)]
@@ -101,6 +116,7 @@ impl LastDictation {
             audio,
             raw: None,
             context: Arc::new(CaptureContext::default()),
+            pending_context: None,
         });
         id
     }
@@ -146,6 +162,7 @@ impl LastDictation {
             samples: retained.audio.clone().unwrap_or_default(),
             raw: retry.cleanup_only.then(|| retained.raw.clone()).flatten(),
             context: retained.context.clone(),
+            pending_context: retained.pending_context.clone(),
         })
     }
 
@@ -161,6 +178,18 @@ impl LastDictation {
                 record.snapshot.raw_available = true;
             }
             record.context = context;
+            record.pending_context = None;
+        }
+    }
+
+    pub fn pending_context(&self, id: u64, context: ContextCapture) {
+        let mut state = self.0.lock().unwrap();
+        if let Some(record) = state
+            .retained
+            .as_mut()
+            .filter(|record| record.snapshot.id == id)
+        {
+            record.pending_context = Some(context);
         }
     }
 
@@ -172,6 +201,7 @@ impl LastDictation {
             .filter(|record| record.snapshot.id == id)
         {
             record.context = context;
+            record.pending_context = None;
         }
     }
 
@@ -251,6 +281,23 @@ mod tests {
         drop(connection);
         assert!(!last.snapshot().unwrap().busy);
         assert!(last.request(retry).is_err());
+    }
+
+    #[test]
+    fn unprocessed_recording_keeps_original_pending_context_for_retry() {
+        let last = LastDictation::default();
+        let id = last.retain(Arc::new(vec![0.25; 1600]));
+        // Disabled context performs no desktop inspection, but retains the same async owner.
+        let context = ContextCapture::start(Default::default());
+        last.pending_context(id, context.clone());
+        last.finish(id, None, Some("dictation queue is full".into()), None);
+        let recording = last
+            .recording(Retry {
+                id,
+                cleanup_only: false,
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&recording.context(), &context.take()));
     }
 
     #[test]

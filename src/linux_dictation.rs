@@ -156,10 +156,10 @@ pub fn run(
             let mut processed_text = None;
             let mut timings = DictationTimings {
                 audio_ms: job.audio_ms,
-                realtime: settings
-                    .cloud_transcription
-                    .as_ref()
-                    .is_some_and(|cloud| cloud.mode == crate::cloud::TranscriptionMode::Realtime),
+                realtime: !preview
+                    && settings.cloud_transcription.as_ref().is_some_and(|cloud| {
+                        cloud.mode == crate::cloud::TranscriptionMode::Realtime
+                    }),
                 queue_ms: job.released_at.elapsed().as_millis() as u64,
                 ..Default::default()
             };
@@ -173,42 +173,23 @@ pub fn run(
                     } else {
                         measure_stage(&mut timings.transcription_ms, || -> Result<String> {
                             let text = if let Some(cloud) = &settings.cloud_transcription {
-                                if let Some(realtime) = job.realtime {
-                                    let outcome = realtime.finish_with_metrics(
-                                        &job.samples,
-                                        &job.control.cancelled,
-                                        Duration::from_secs(cloud.deadline_seconds),
-                                    );
-                                    timings.retries = outcome.retries;
-                                    outcome.result?
-                                } else if cloud.mode == crate::cloud::TranscriptionMode::Realtime {
-                                    let outcome = crate::cloud::RealtimeSession::start(
-                                        cloud.clone(),
-                                        job.control.cancelled.clone(),
-                                        |_| {},
-                                    )
-                                    .finish_with_metrics(
-                                        &job.samples,
-                                        &job.control.cancelled,
-                                        Duration::from_secs(cloud.deadline_seconds),
-                                    );
-                                    timings.retries = outcome.retries;
-                                    outcome.result?
-                                } else {
-                                    crate::cloud::transcribe(
-                                        cloud,
-                                        &job.samples,
-                                        &job.control.cancelled,
-                                        |text| {
-                                            let _ = partial_events.emit(&VoiceEvent::Transcript {
-                                                timestamp_ms: now_ms(),
-                                                phase: TranscriptPhase::Updated,
-                                                latency_ms: 0,
-                                                text: text.to_owned(),
-                                            });
-                                        },
-                                    )?
-                                }
+                                let outcome = crate::cloud::transcribe_recording(
+                                    cloud,
+                                    &job.samples,
+                                    job.realtime,
+                                    preview,
+                                    &job.control.cancelled,
+                                    |text| {
+                                        let _ = partial_events.emit(&VoiceEvent::Transcript {
+                                            timestamp_ms: now_ms(),
+                                            phase: TranscriptPhase::Updated,
+                                            latency_ms: 0,
+                                            text: text.to_owned(),
+                                        });
+                                    },
+                                );
+                                timings.retries = outcome.retries;
+                                outcome.result?
                             } else {
                                 let mut samples = (*job.samples).clone();
                                 crate::dictation::pad_for_parakeet(&mut samples);
@@ -227,14 +208,12 @@ pub fn run(
                 let context = measure_stage(&mut timings.context_wait_ms, || {
                     job.retry
                         .as_ref()
-                        .map(|retry| retry.context.clone())
+                        .map(|retry| retry.context())
                         .unwrap_or_else(|| {
-                            Arc::new(
-                                pending_context
-                                    .take()
-                                    .map(crate::linux_context::ContextCapture::take)
-                                    .unwrap_or_default(),
-                            )
+                            pending_context
+                                .take()
+                                .map(|context| context.take())
+                                .unwrap_or_default()
                         })
                 });
                 worker_last.raw(job.recording_id, &text, context.clone());
@@ -264,8 +243,7 @@ pub fn run(
             .map_err(|error| format!("{error:#}"));
             // Preserve original focus context even if ASR failed before cleanup.
             if let Some(context) = pending_context.take() {
-                let context =
-                    measure_stage(&mut timings.context_wait_ms, || Arc::new(context.take()));
+                let context = measure_stage(&mut timings.context_wait_ms, || context.take());
                 worker_last.context(job.recording_id, context);
             }
             job.control.finish();
@@ -616,6 +594,9 @@ fn submit_capture(
             let released_at = Instant::now();
             let samples = Arc::new(clip.into_transcription_samples());
             let recording_id = last.retain(samples.clone());
+            if let Some(context) = &context {
+                last.pending_context(recording_id, context.clone());
+            }
             let job = Job {
                 samples,
                 recording_id,

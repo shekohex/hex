@@ -132,6 +132,13 @@ struct LinuxApp {
     quitting: bool,
     transcription_picker: TranscriptionPickerState,
     provider_editor: Option<gpui::Entity<crate::linux_provider_settings::ProviderEditor>>,
+    last_result_editor: Option<LastResultEditor>,
+}
+
+struct LastResultEditor {
+    recording_id: u64,
+    source: String,
+    input: gpui::Entity<crate::text_input::TextInput>,
 }
 
 enum TranscriptionPickerState {
@@ -445,6 +452,7 @@ pub fn open(start_hidden: bool, shutdown: &'static AtomicBool) -> Result<()> {
                         quitting: false,
                         transcription_picker: TranscriptionPickerState::Closed,
                         provider_editor: None,
+                        last_result_editor: None,
                     })
                 },
             )
@@ -1214,11 +1222,25 @@ impl LinuxApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = last.id;
+        if self
+            .last_result_editor
+            .as_ref()
+            .is_none_or(|editor| editor.recording_id != id || editor.source != last.text)
+        {
+            self.last_result_editor = Some(LastResultEditor {
+                recording_id: id,
+                source: last.text.clone(),
+                input: cx.new(|cx| {
+                    crate::text_input::TextInput::multiline(cx, "Transcription result", &last.text)
+                }),
+            });
+        }
+        let result_input = self.last_result_editor.as_ref().unwrap().input.clone();
         let available =
             !self.quitting && !self.host.editing_settings() && self.host.is_running() && !last.busy;
         let audio_available = last.audio_available;
         let raw_available = last.raw_available;
-        let copy_available = !last.text.is_empty();
+        let copy_available = !result_input.read(cx).text().is_empty();
         let controls = div()
             .flex()
             .flex_wrap()
@@ -1233,10 +1255,16 @@ impl LinuxApp {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if available && audio_available {
-                            let _ = this.host.send(Request::RetryLast {
-                                id,
-                                cleanup_only: false,
-                            });
+                            if this
+                                .host
+                                .send(Request::RetryLast {
+                                    id,
+                                    cleanup_only: false,
+                                })
+                                .is_ok()
+                            {
+                                this.last_result_editor = None;
+                            }
                             cx.notify();
                         }
                     })),
@@ -1249,10 +1277,16 @@ impl LinuxApp {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if available && raw_available {
-                            let _ = this.host.send(Request::RetryLast {
-                                id,
-                                cleanup_only: true,
-                            });
+                            if this
+                                .host
+                                .send(Request::RetryLast {
+                                    id,
+                                    cleanup_only: true,
+                                })
+                                .is_ok()
+                            {
+                                this.last_result_editor = None;
+                            }
                             cx.notify();
                         }
                     })),
@@ -1262,16 +1296,13 @@ impl LinuxApp {
                     .id("last-copy")
                     .when(!copy_available, |button| button.opacity(0.5))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(result) = this
-                            .host
-                            .client
-                            .state
+                        if let Some(editor) = this
+                            .last_result_editor
                             .as_ref()
-                            .and_then(|state| state.last_dictation.as_ref())
-                            .filter(|result| result.id == id && !result.text.is_empty())
+                            .filter(|editor| editor.recording_id == id)
                         {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                result.text.clone(),
+                                editor.input.read(cx).text().to_owned(),
                             ));
                         }
                     })),
@@ -1306,20 +1337,7 @@ impl LinuxApp {
                         .id("last-dictation-preview")
                         .px_4()
                         .py_3()
-                        .max_h(px(160.0))
-                        .overflow_y_scroll()
-                        .overflow_x_hidden()
-                        .text_size(px(13.0))
-                        .child(last.text.chars().take(4000).collect::<String>())
-                        .when(last.text.chars().count() > 4000, |preview| {
-                            preview.child(
-                                div()
-                                    .mt_2()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(MUTED))
-                                    .child("Preview only; Copy includes the full result"),
-                            )
-                        }),
+                        .child(result_input),
                 )
             });
         if let Some(timings) = &last.timings {
@@ -1380,6 +1398,9 @@ impl LinuxApp {
             .state
             .as_ref()
             .and_then(|state| state.last_dictation.clone());
+        if last_dictation.is_none() {
+            self.last_result_editor = None;
+        }
         let running = snapshot.listener.running;
         let double_tap_lock = snapshot.double_tap_lock;
         let editing = self.host.editing_settings();

@@ -622,9 +622,9 @@ Linux Settings > Models & Processing      // dictate.providers.linux
 ├── Cloud / Stream -> Compatible audio upload, optional response SSE
 └── Realtime -> Intentional capture -> Bounded audio projection -> Commit -> Final
     ├── Temporary queue pressure -> Retain unsent capture suffix -> Retry / drain at release
-    ├── Transient disconnect / HTTP 429 or 5xx -> Up to N reconnects after release
-    │   └── Full capture replay; shared deadline; default 2 retries, configurable 0–10
-    └── Exhausted / permanent failure / missing final -> No partial paste
+    ├── Live/stream failure -> Full recording -> Same provider/model, normal batch upload
+    │   └── Up to N batch attempts; default 2, configurable 0–10; no WS/SSE retry
+    └── Failed batch recovery -> No partial paste
 
 Processing Modes                         // modes.providers.linux
 ├── Application match -> Mode replaces Global
@@ -684,9 +684,10 @@ geometry; captured rectangles may include overlapping content.
 Linux Settings > Last dictation          // dictate.retry.linux
 ├── Accepted recording -> Replace one RAM-only audio/raw/context/result record
 │   └── Failed ASR -> Keep audio and original context for another attempt
-├── Retry transcription -> Current speech config -> Current cleanup -> Preview
+├── Retry transcription -> Current provider/model, normal batch upload -> Cleanup -> Preview
 ├── Retry cleanup -> Saved raw text + original context -> Current cleanup -> Preview
-├── Copy -> Full latest result; retries never paste into Settings
+├── Textarea -> Full result, selection/scrolling/local edits -> Copy current text
+│   └── Cleanup retries still start from saved raw text, not textarea edits
 └── Clear / service exit -> Drop retained record; Settings close does not clear it
 
 Latest result + structured logs          // dictate.timings.linux
@@ -700,31 +701,54 @@ Sources: [RAM owner](../../src/linux_last_dictation.rs),
 [transport](../../src/linux_service.rs), and [events](../../src/events.rs).
 The service retains at most 32 MiB of 16 kHz float audio (about eight minutes),
 2 MiB each of raw/final text, and the existing bounded original context. Longer
-recordings still transcribe but have no audio retry. Preview caps at 4,000
-characters; Copy uses full retained text. Retrying needs a running listener and
+recordings still transcribe but have no audio retry. The shared multiline
+`TextInput` shows full retained text with selection, scrolling, and local editing;
+Copy reads its edited text. Service refreshes preserve edits until a new result
+or explicit retry replaces them. Textarea edits never replace the saved raw input.
+Retrying needs a running listener and
 uses the same bounded ordered worker queue. Provider-setting edits preserve the
 RAM record; the next retry uses new settings. Replacing a record fences old
-completions, retries, and Clear actions by ID. This is not persistent History.
+completions, retries, and Clear actions by ID. Pending original context is shared
+with the RAM record before queue admission, so queue rejection or listener
+shutdown cannot discard it. Only the output worker resolves that snapshot;
+capture/IPC never wait for context. This is not persistent History.
 IPC requests stay capped at 128 KiB; replies allow 16 MiB for JSON-escaped text,
 with the existing peer-UID checks and I/O deadlines. Audio/context never cross IPC.
 
-Retries occur after release for transient connection failures or HTTP 429/5xx,
-not invalid credentials/configuration. Backoff, reconnect, replay, and finalization
-share one deadline; cancellation stops all attempts. No partial output is pasted.
-Realtime timing measures finalization after worker admission, not overlapping live
-ASR. Context timing measures remaining wait, not capture work. Skipped stages are
-absent; cleanup fallback retains latency/error. Manual retry skips paste and
-cleanup-only retry skips ASR. Normal paste failure still exposes generated text.
+A failed realtime/streaming attempt recovers through `/audio/transcriptions`
+using the entire recording and `response_format=json`; it never reconnects the
+WebSocket or repeats `stream=true`. This includes unsupported streaming contracts
+and missing completion events. The same configured provider/model is used. A
+batch attempt retries only transient transport failures, HTTP 429/5xx, not permanent
+credentials/model/configuration errors. Manual remote transcription retries start
+with batch directly; local retries remain local. Zero disables automatic recovery.
+Initial attempt has its configured deadline; recovery gets one fresh configured
+budget shared across batch attempts/backoff. Cancellation stops both. Cleanup
+receives only the complete successful transcript, original capture context, and
+current processing settings; no partial output is pasted.
 
-Checks in [realtime tests](../../src/cloud/realtime.rs) disconnect after receiving
-partial audio and compare replayed PCM against the entire clip. Other checks
-exercise retry limits (including zero), permanent HTTP 401, cancellation/shared
-deadline during HTTP 429 backoff, RAM lifetime, failed-ASR context retention, raw
-rather than enhanced cleanup input, stale-ID fencing, audio cap, large bounded
-replies, and failed-stage event serialization. These are loopback/state checks;
-native new-button interaction and live-gateway retry remain unverified.
-The full debug suite passed (273 tests, 16 opt-in checks skipped), followed by
-strict all-target/all-feature Clippy and formatting on October 18, 2026.
+Realtime timing measures finalization (including batch recovery) after worker
+admission, not overlapping live ASR. Manual retry uses transcription timing,
+not realtime finalization. Context timing measures remaining wait, not capture
+work. Skipped stages are absent; cleanup fallback retains latency/error. Manual
+retry skips paste and cleanup-only retry skips ASR. Normal paste failure still
+exposes generated text.
+
+Checks in [cloud tests](../../src/cloud/tests.rs) disconnect or send an explicit
+server transcription failure after partial live audio and require the next request to be a normal multipart POST containing every
+original PCM sample. That regression failed with `retry must upload batch, got
+GET /v1/realtime` before correction and passed after. Streaming failure checks
+then run cleanup and inspect its input for the complete batch transcript plus
+retained original clipboard, active-field, OCR, and application context. Other
+checks cover direct manual batch retries, retry limits (including zero),
+permanent HTTP 401, cancellation, fresh recovery budget after initial timeout,
+and shared recovery deadline/backoff. [RAM-owner tests](../../src/linux_last_dictation.rs)
+cover lifetime, failed-ASR and unprocessed-job context retention, raw rather than enhanced cleanup
+input, stale-ID fencing, and audio cap. Transport/events tests cover large bounded
+replies and failed-stage timing serialization. These are loopback/state checks;
+native new-button interaction and live-gateway fallback remain unverified.
+Observed October 18, 2026: full debug suite passed (278 tests, 16 opt-in checks
+skipped), strict all-target/all-feature Clippy and formatting passed.
 
 Thinking presets persist per mode and survive restart; older settings retain
 provider defaults. Chat and Responses expose Off through Max; native Gemini uses

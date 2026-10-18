@@ -264,8 +264,9 @@ succeeds.
 Linux failed cloud dictation can be retried from **Settings > Last dictation**
 without speaking again. Audio/raw text/context remain in RAM until replaced,
 cleared, or service exit; see [retry and timing behavior](README.md#other-platforms-and-consumers).
-Transient realtime connections retry automatically up to the configured limit
-(default two retries) within the finalization deadline. Manual retries produce a
+Failed realtime/streaming requests recover by uploading the full recording through
+normal batch transcription, up to the configured limit (default two batch attempts).
+Recovery has its own bounded deadline; no WebSocket/streaming retry occurs. Manual retries produce a
 copyable preview, not an automatic paste; the listener must be running.
 
 `recover.linux-listener`: Settings exposes listener status, Start/Stop, and

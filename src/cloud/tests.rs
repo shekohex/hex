@@ -884,3 +884,437 @@ fn legacy_transcription_settings_default_to_two_retries_and_reject_excessive_cou
     settings.max_retries = 11;
     assert!(settings.validate().is_err());
 }
+
+#[test]
+fn failed_realtime_uploads_entire_recording_as_batch_instead_of_reconnecting() {
+    use tokio_tungstenite::tungstenite::{Message, accept};
+    for server_failure in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let settings = TranscriptionSettings {
+            connection: ConnectionSettings {
+                base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+                api_key_env: String::new(),
+                api_key_file: None,
+            },
+            model: "fixture".into(),
+            mode: TranscriptionMode::Realtime,
+            ..Default::default()
+        };
+        let (partial_sent, partial_seen) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = accept(stream).unwrap();
+            socket.read().unwrap();
+            socket
+                .send(Message::text(r#"{"type":"session.updated"}"#))
+                .unwrap();
+            let event: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(event["type"], "input_audio_buffer.append");
+            if server_failure {
+                socket.send(Message::text(r#"{"type":"conversation.item.input_audio_transcription.failed","error":{"code":"server_error"}}"#)).unwrap();
+            }
+            drop(socket);
+            partial_sent.send(()).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let body = r#"{"text":"Recovered batch."}"#;
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            request
+        });
+        let audio = (0..16_000 * 30 + 1)
+            .map(|index| (index as f32 * 0.01).sin())
+            .collect::<Vec<_>>();
+        let mut session =
+            RealtimeSession::start(settings.clone(), Arc::new(AtomicBool::new(false)), |_| {});
+        session.offer(&audio[..1600]);
+        partial_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Thirty seconds of capture continue even after the live projection fails.
+        for available in (3200..audio.len()).step_by(1600) {
+            session.offer(&audio[session.offered_samples()..available]);
+        }
+
+        let outcome = transcribe_recording(
+            &settings,
+            &audio,
+            Some(session),
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        let request = worker.join().unwrap();
+        assert!(
+            request
+                .headers
+                .starts_with("POST /v1/audio/transcriptions "),
+            "retry must upload batch, got {}",
+            request.headers.lines().next().unwrap()
+        );
+        assert_eq!(outcome.result.unwrap(), "Recovered batch.");
+        assert_eq!(outcome.retries, 1);
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(!body.contains("name=\"stream\""));
+        assert!(body.contains("name=\"response_format\"\r\n\r\njson"));
+        let start = request
+            .body
+            .windows(4)
+            .position(|bytes| bytes == b"RIFF")
+            .unwrap();
+        let mut wav = hound::WavReader::new(Cursor::new(&request.body[start..])).unwrap();
+        let received = wav.samples::<i16>().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(
+            received,
+            audio
+                .iter()
+                .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+fn upload_sequence(
+    responses: Vec<(u16, &'static str, &'static str)>,
+) -> (ConnectionSettings, JoinHandle<Vec<RecordedRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, content_type, body) in responses {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(5),
+                            "missing batch retry"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            requests.push(read_request(&mut stream));
+            write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        // Keep the port open until all expected attempts complete, exposing extra attempts.
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        requests
+    });
+    (
+        ConnectionSettings {
+            base_url: format!("http://{address}/v1"),
+            api_key_env: String::new(),
+            api_key_file: None,
+        },
+        worker,
+    )
+}
+
+#[test]
+fn incomplete_stream_falls_back_to_batch_then_cleanup_uses_retained_context() {
+    use crate::linux_context::{CaptureContext, ContextSettings, ScreenContextMode};
+    use crate::linux_last_dictation::{LastDictation, Retry};
+    use crate::linux_pipeline::{CleanupBackend, PipelineMode, PipelineSettings};
+    let (connection, worker) = upload_sequence(vec![
+        (
+            200,
+            "text/event-stream",
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"partial\"}\n\n",
+        ),
+        (
+            200,
+            "application/json",
+            r#"{"text":"full batch transcript"}"#,
+        ),
+        (
+            200,
+            "application/json",
+            r#"{"choices":[{"finish_reason":"stop","message":{"content":"Cleaned batch."}}]}"#,
+        ),
+    ]);
+    let settings = TranscriptionSettings {
+        connection: connection.clone(),
+        model: "fixture".into(),
+        mode: TranscriptionMode::Streaming,
+        ..Default::default()
+    };
+    let last = LastDictation::default();
+    let audio = Arc::new(vec![0.25; 16_000]);
+    let id = last.retain(audio.clone());
+    let original_context = Arc::new(CaptureContext {
+        application: Some("Original editor".into()),
+        clipboard: Some("Original clipboard".into()),
+        active_field: Some("Original field".into()),
+        screen_text: Some("Original OCR".into()),
+        ..Default::default()
+    });
+    last.context(id, original_context.clone());
+    let outcome = transcribe_recording(
+        &settings,
+        &audio,
+        None,
+        false,
+        &AtomicBool::new(false),
+        |_| {},
+    );
+    let raw = outcome.result.unwrap();
+    assert_eq!(outcome.retries, 1);
+    last.raw(id, &raw, original_context);
+    last.finish(id, Some(&raw), None, None);
+    let retained = last
+        .recording(Retry {
+            id,
+            cleanup_only: true,
+        })
+        .unwrap();
+    let pipeline = PipelineSettings {
+        default_mode: PipelineMode {
+            enabled: true,
+            backend: CleanupBackend::ChatCompletions,
+            connection,
+            model: "cleanup".into(),
+            context: ContextSettings {
+                clipboard: true,
+                active_field: true,
+                screen: ScreenContextMode::Ocr,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (cleaned, observation) = pipeline.process(
+        retained.raw.as_deref().unwrap(),
+        &retained.context(),
+        &AtomicBool::new(false),
+    );
+    assert_eq!(cleaned, "Cleaned batch.");
+    assert!(observation.unwrap().fallback.is_none());
+    let requests = worker.join().unwrap();
+    assert!(String::from_utf8_lossy(&requests[0].body).contains("name=\"stream\"\r\n\r\ntrue"));
+    assert!(!String::from_utf8_lossy(&requests[1].body).contains("name=\"stream\""));
+    assert!(
+        requests[2]
+            .headers
+            .starts_with("POST /v1/chat/completions ")
+    );
+    let cleanup: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    let input = cleanup["messages"][1]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    for expected in [
+        "full batch transcript",
+        "Original clipboard",
+        "Original field",
+        "Original OCR",
+        "Original editor",
+    ] {
+        assert!(
+            input.contains(expected),
+            "missing original context: {expected}"
+        );
+    }
+    assert!(!input.contains("partial"));
+}
+
+#[test]
+fn manual_retry_uses_batch_for_realtime_and_streaming_modes() {
+    for mode in [TranscriptionMode::Realtime, TranscriptionMode::Streaming] {
+        let (connection, worker) = upload_sequence(vec![(
+            200,
+            "application/json",
+            r#"{"text":"Manual batch."}"#,
+        )]);
+        let settings = TranscriptionSettings {
+            connection,
+            mode,
+            ..Default::default()
+        };
+        let outcome = transcribe_recording(
+            &settings,
+            &[0.25; 1600],
+            None,
+            true,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert_eq!(outcome.result.unwrap(), "Manual batch.");
+        assert_eq!(outcome.retries, 0);
+        let requests = worker.join().unwrap();
+        assert!(
+            requests[0]
+                .headers
+                .starts_with("POST /v1/audio/transcriptions ")
+        );
+        assert!(!String::from_utf8_lossy(&requests[0].body).contains("name=\"stream\""));
+    }
+}
+
+#[test]
+fn batch_retries_respect_configured_count_and_stop_on_permanent_failure() {
+    for (limit, status, expected_attempts) in [(0, 503, 1), (2, 503, 3), (2, 401, 2)] {
+        let responses = (0..expected_attempts)
+            .map(|index| {
+                (
+                    if index == 0 { 400 } else { status },
+                    "application/json",
+                    "{}",
+                )
+            })
+            .collect();
+        let (connection, worker) = upload_sequence(responses);
+        let settings = TranscriptionSettings {
+            connection,
+            mode: TranscriptionMode::Streaming,
+            max_retries: limit,
+            ..Default::default()
+        };
+        let outcome = transcribe_recording(
+            &settings,
+            &[0.25; 1600],
+            None,
+            false,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert!(outcome.result.is_err());
+        assert_eq!(usize::from(outcome.retries), expected_attempts - 1);
+        let requests = worker.join().unwrap();
+        for request in requests.iter().skip(1) {
+            assert!(!String::from_utf8_lossy(&request.body).contains("name=\"stream\""));
+        }
+    }
+}
+
+#[test]
+fn cancelled_recording_does_not_start_batch_recovery() {
+    let (connection, worker) = upload_sequence(vec![]);
+    let settings = TranscriptionSettings {
+        connection,
+        mode: TranscriptionMode::Realtime,
+        ..Default::default()
+    };
+    let outcome = transcribe_recording(
+        &settings,
+        &[0.25; 1600],
+        None,
+        false,
+        &AtomicBool::new(true),
+        |_| {},
+    );
+    assert!(
+        outcome
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
+    assert_eq!(outcome.retries, 0);
+    assert!(worker.join().unwrap().is_empty());
+}
+
+#[test]
+fn timed_out_stream_gets_a_fresh_batch_recovery_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let settings = TranscriptionSettings {
+        connection: ConnectionSettings {
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            api_key_env: String::new(),
+            api_key_file: None,
+        },
+        mode: TranscriptionMode::Streaming,
+        deadline_seconds: 1,
+        ..Default::default()
+    };
+    let worker = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(4));
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            let request = read_request(&mut stream);
+            if attempt == 0 {
+                thread::sleep(Duration::from_millis(1200));
+            } else {
+                assert!(!String::from_utf8_lossy(&request.body).contains("name=\"stream\""));
+                let body = r#"{"text":"Recovered after timeout."}"#;
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        }
+    });
+    let outcome = transcribe_recording(
+        &settings,
+        &[0.25; 1600],
+        None,
+        false,
+        &AtomicBool::new(false),
+        |_| {},
+    );
+    worker.join().unwrap();
+    assert_eq!(outcome.result.unwrap(), "Recovered after timeout.");
+    assert_eq!(outcome.retries, 1);
+}
+
+#[test]
+fn batch_backoff_shares_recovery_deadline_and_stream_cancellation_never_uploads_again() {
+    let (connection, worker) = upload_sequence(vec![
+        (400, "application/json", "{}"),
+        (429, "application/json", "{}"),
+        (429, "application/json", "{}"),
+        (429, "application/json", "{}"),
+    ]);
+    let settings = TranscriptionSettings {
+        connection,
+        mode: TranscriptionMode::Streaming,
+        max_retries: 10,
+        deadline_seconds: 1,
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let outcome = transcribe_recording(
+        &settings,
+        &[0.25; 1600],
+        None,
+        false,
+        &AtomicBool::new(false),
+        |_| {},
+    );
+    assert!(outcome.result.unwrap_err().to_string().contains("deadline"));
+    assert_eq!(outcome.retries, 3);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(worker.join().unwrap().len(), 4);
+
+    let (connection, worker) = upload_sequence(vec![(
+        200,
+        "text/event-stream",
+        "data: {\"type\":\"transcript.text.delta\",\"delta\":\"partial\"}\n\n",
+    )]);
+    let settings = TranscriptionSettings {
+        connection,
+        mode: TranscriptionMode::Streaming,
+        ..Default::default()
+    };
+    let cancelled = AtomicBool::new(false);
+    let outcome = transcribe_recording(&settings, &[0.25; 1600], None, false, &cancelled, |_| {
+        cancelled.store(true, Ordering::Release);
+    });
+    assert!(outcome.result.is_err());
+    assert_eq!(outcome.retries, 0);
+    assert_eq!(worker.join().unwrap().len(), 1);
+}

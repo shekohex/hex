@@ -9,7 +9,7 @@ use std::io::{Cursor, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
@@ -155,7 +155,7 @@ impl TranscriptionSettings {
         self.connection.validate()?;
         validate_model(&self.model, self.deadline_seconds)?;
         if self.max_retries > 10 {
-            bail!("Realtime retries must be between 0 and 10");
+            bail!("Transcription retries must be between 0 and 10");
         }
         if self.language.len() > 32 || self.prompt.len() > 16 * 1024 {
             bail!("Transcription language or recognition prompt is too long");
@@ -255,15 +255,35 @@ fn http_client() -> Result<Client> {
         .build()?)
 }
 
+#[derive(Debug)]
+struct HttpFailure(reqwest::StatusCode);
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Provider request failed (HTTP {})",
+            self.0.as_u16()
+        )
+    }
+}
+impl std::error::Error for HttpFailure {}
+
 async fn checked_response(response: Response) -> Result<Response> {
     if !response.status().is_success() {
         // Never echo provider bodies: they may contain credentials or private context.
-        bail!(
-            "Provider request failed (HTTP {})",
-            response.status().as_u16()
-        );
+        return Err(eyre!(HttpFailure(response.status())));
     }
     Ok(response)
+}
+
+fn retryable_upload(error: &color_eyre::eyre::Report) -> bool {
+    if let Some(HttpFailure(status)) = error.downcast_ref::<HttpFailure>() {
+        return status.as_u16() == 429 || status.is_server_error();
+    }
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_connect() || error.is_timeout() || error.is_body())
 }
 
 async fn json_response(mut response: Response) -> Result<Value> {
@@ -277,6 +297,93 @@ async fn json_response(mut response: Response) -> Result<Value> {
     serde_json::from_slice(&bytes).wrap_err("Provider returned invalid JSON")
 }
 
+pub struct TranscriptionOutcome {
+    pub result: Result<String>,
+    pub retries: u8,
+}
+
+/// Completes one recording before cleanup. Capture retains authoritative PCM.
+pub fn transcribe_recording(
+    settings: &TranscriptionSettings,
+    samples: &[f32],
+    realtime: Option<RealtimeSession>,
+    manual_retry: bool,
+    cancelled: &AtomicBool,
+    mut observe: impl FnMut(&str),
+) -> TranscriptionOutcome {
+    let mut retries = 0;
+    let result = (|| -> Result<String> {
+        settings.validate()?;
+        if cancelled.load(Ordering::Acquire) {
+            bail!("Dictation cancelled");
+        }
+        let mut batch = settings.clone();
+        batch.mode = TranscriptionMode::Batch;
+        let initial = if manual_retry { &batch } else { settings };
+        let result = if initial.mode == TranscriptionMode::Realtime {
+            realtime
+                .unwrap_or_else(|| {
+                    RealtimeSession::start(
+                        settings.clone(),
+                        std::sync::Arc::new(AtomicBool::new(false)),
+                        |_| {},
+                    )
+                })
+                .finish(
+                    samples,
+                    cancelled,
+                    Duration::from_secs(settings.deadline_seconds),
+                )
+        } else {
+            drop(realtime);
+            transcribe(initial, samples, cancelled, &mut observe)
+        };
+        let mut error = match result {
+            Ok(text) => return Ok(text),
+            Err(error) => error,
+        };
+        if initial.mode == TranscriptionMode::Batch && !retryable_upload(&error) {
+            return Err(error);
+        }
+        // Recovery gets its own budget: a stalled live request must not use it up.
+        let recovery_started = Instant::now();
+        let recovery_budget = Duration::from_secs(settings.deadline_seconds);
+        for attempt in 1..=settings.max_retries {
+            if cancelled.load(Ordering::Acquire) {
+                bail!("Dictation cancelled");
+            }
+            if attempt > 1 {
+                let delay = Duration::from_millis(250 * (1u64 << (attempt - 2).min(3)));
+                run_cancellable(
+                    cancelled,
+                    recovery_budget.saturating_sub(recovery_started.elapsed()),
+                    async {
+                        tokio::time::sleep(delay).await;
+                        Ok(())
+                    },
+                )?;
+            }
+            let remaining = recovery_budget.saturating_sub(recovery_started.elapsed());
+            if remaining.is_zero() {
+                bail!("Batch transcription recovery deadline expired");
+            }
+            retries = attempt;
+            tracing::warn!(
+                retry = attempt,
+                limit = settings.max_retries,
+                "retrying transcription with full batch upload"
+            );
+            match upload_transcription(&batch, samples, cancelled, remaining, &mut observe) {
+                Ok(text) => return Ok(text),
+                Err(failure) if retryable_upload(&failure) => error = failure,
+                Err(failure) => return Err(failure),
+            }
+        }
+        Err(error)
+    })();
+    TranscriptionOutcome { result, retries }
+}
+
 pub fn transcribe(
     settings: &TranscriptionSettings,
     samples: &[f32],
@@ -284,20 +391,34 @@ pub fn transcribe(
     mut observe: impl FnMut(&str),
 ) -> Result<String> {
     settings.validate()?;
+    upload_transcription(
+        settings,
+        samples,
+        cancelled,
+        Duration::from_secs(settings.deadline_seconds),
+        &mut observe,
+    )
+}
+
+fn upload_transcription(
+    settings: &TranscriptionSettings,
+    samples: &[f32],
+    cancelled: &AtomicBool,
+    deadline: Duration,
+    observe: &mut dyn FnMut(&str),
+) -> Result<String> {
     let client = http_client()?;
-    // Chunk uploads, not capture: arbitrarily long dictations remain supported.
-    let mut output = Vec::new();
-    for samples in samples.chunks(AUDIO_CHUNK_SAMPLES) {
-        let text = run_cancellable(
-            cancelled,
-            Duration::from_secs(settings.deadline_seconds),
-            transcribe_chunk(&client, settings, samples, &mut observe),
-        )?;
-        if !text.trim().is_empty() {
-            output.push(text.trim().to_owned());
+    run_cancellable(cancelled, deadline, async {
+        // Chunk uploads, not capture: every sample is sent, including after live failure.
+        let mut output = Vec::new();
+        for samples in samples.chunks(AUDIO_CHUNK_SAMPLES) {
+            let text = transcribe_chunk(&client, settings, samples, observe).await?;
+            if !text.trim().is_empty() {
+                output.push(text.trim().to_owned());
+            }
         }
-    }
-    nonempty(output.join(" "))
+        nonempty(output.join(" "))
+    })
 }
 
 async fn transcribe_chunk(

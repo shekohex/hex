@@ -285,7 +285,9 @@ impl ProviderEditor {
                     .trim()
                     .parse()
                     .map_err(|_| {
-                        color_eyre::eyre::eyre!("Realtime retries must be a number from 0 to 10")
+                        color_eyre::eyre::eyre!(
+                            "Transcription retries must be a number from 0 to 10"
+                        )
                     })?;
                 self.speech.deadline_seconds = self
                     .speech_inputs
@@ -392,12 +394,10 @@ impl Render for ProviderEditor {
                     .child(field("Language", &self.speech_inputs.language))
                     .child(field("Recognition hints", &self.speech_inputs.hints))
                     .child(field("Deadline (seconds)", &self.speech_inputs.deadline))
-                    .when(self.speech.mode == TranscriptionMode::Realtime, |panel| {
-                        panel.child(field(
-                            "Connection retries (0–10)",
-                            &self.speech_inputs.retries,
-                        ))
-                    })
+                    .child(field(
+                        "Transcription retries (0–10)",
+                        &self.speech_inputs.retries,
+                    ))
             });
         let mode_names = std::iter::once((None, "Global".to_owned()))
             .chain(

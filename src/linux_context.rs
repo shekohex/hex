@@ -5,6 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{Result, bail, eyre};
@@ -59,8 +60,10 @@ pub struct CaptureContext {
     pub screen_text: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ContextCapture {
-    result: Receiver<CaptureContext>,
+    result: Arc<Mutex<Receiver<CaptureContext>>>,
+    captured: Arc<OnceLock<Arc<CaptureContext>>>,
 }
 
 impl ContextCapture {
@@ -81,13 +84,24 @@ impl ContextCapture {
                 let _ = sender.try_send(capture(&settings));
             });
         }
-        Self { result }
+        Self {
+            result: Arc::new(Mutex::new(result)),
+            captured: Arc::default(),
+        }
     }
 
-    pub fn take(self) -> CaptureContext {
-        self.result
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap_or_default()
+    pub fn take(&self) -> Arc<CaptureContext> {
+        self.captured
+            .get_or_init(|| {
+                Arc::new(
+                    self.result
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap_or_default(),
+                )
+            })
+            .clone()
     }
 }
 
