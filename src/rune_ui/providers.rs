@@ -701,13 +701,22 @@ pub(super) fn last_result(ui: &Ui, p: Paint) -> Option<El> {
                 move |ui: &mut Ui, _| {
                     if let super::Service::Live(backend) = &ui.service
                         && let super::host::Backend::Host(host) = backend.as_ref()
-                        && let Err(error) =
-                            host.provider_request(crate::linux_service::Request::RetryLast {
-                                id,
-                                cleanup_only,
-                            })
                     {
-                        ui.error = Some(error.to_string());
+                        match host.provider_request(crate::linux_service::Request::RetryLast {
+                            id,
+                            cleanup_only,
+                        }) {
+                            Ok(()) => {
+                                ui.providers.last_text = TextEdit::new(
+                                    ui.providers
+                                        .last
+                                        .as_ref()
+                                        .map(|last| last.text.clone())
+                                        .unwrap_or_default(),
+                                );
+                            }
+                            Err(error) => ui.error = Some(error.to_string()),
+                        }
                     }
                 },
             ));

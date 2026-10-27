@@ -33,6 +33,24 @@ impl ModeRuntime {
         }
     }
 
+    /// Provider cleanup owns its own corrections and rewrite, but still uses
+    /// the current Modes pane's selected final transformation chain.
+    #[cfg(target_os = "linux")]
+    pub fn provider_transformations(
+        &self,
+        context: &crate::context::ContextSnapshot,
+    ) -> Vec<String> {
+        mode_for_context(
+            &self.modes,
+            context.application.as_deref(),
+            context.browser_host(),
+        )
+        .map_or_else(
+            || self.default_transformations.clone(),
+            |mode| mode.transformations.clone(),
+        )
+    }
+
     /// Global replacements, then the matching mode's corrections,
     /// post-processing, and transformations.
     #[cfg(any(test, target_os = "windows"))]

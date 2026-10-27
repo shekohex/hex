@@ -282,8 +282,9 @@ The old branch `feat/linux-cloud-pipelines` at `557595a` remains reference-only.
 Shared `settings.json`, Rune UI, local streaming engine, portal/CLI shortcuts,
 Voice Action, transformations, and retained History remain upstream-owned.
 Provider processing modes replace their own Global mode, without layering.
-When provider processing is configured, it owns cleanup; otherwise upstream Modes
-continue to run. Explicitly choosing a prepared local model disables cloud ASR.
+When provider processing is configured, it owns corrections and cleanup; the
+current Modes pane still selects the final TypeScript/built-in transformation
+chain. Without provider processing, upstream Modes own all processing stages. Explicitly choosing a prepared local model disables cloud ASR.
 
 `linux-settings.json` migrates once, retaining cloud credentials references,
 provider modes/thinking/context, release-microphone, and pause-media preferences.
@@ -309,3 +310,8 @@ in-flight open releases any current input, retains the pending receiver, and
 discards that generation before admitting a newer press's open.
 `audio::tests::idle_release_serializes_cold_opens_and_discards_the_cancelled_generation`
 uses channel-backed inputs without opening a microphone.
+
+Accepted output keeps Escape registered on X11 and portal backends, not only
+GNOME. The input reducer stays idle/idempotent; the dispatcher routes that
+explicit cancellation to the newest unfinished output. Explicit retry also
+resets local textarea edits without changing the retained raw transcript.

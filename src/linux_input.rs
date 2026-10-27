@@ -269,10 +269,19 @@ pub(crate) const ESCAPE_CANCEL_WARNING: &str =
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HotkeyStatus {
     escape_unavailable: Arc<AtomicBool>,
+    output_pending: Arc<AtomicBool>,
     shortcuts: Arc<Mutex<DesktopShortcuts>>,
 }
 
 impl HotkeyStatus {
+    pub(crate) fn set_output_pending(&self, pending: bool) {
+        self.output_pending.store(pending, Ordering::Release);
+    }
+
+    fn wants_escape(&self, recording: bool) -> bool {
+        recording || self.output_pending.load(Ordering::Acquire)
+    }
+
     pub(crate) fn warning(&self) -> Option<String> {
         self.escape_unavailable
             .load(Ordering::Acquire)
@@ -784,8 +793,8 @@ impl Backend {
                 dispatcher.input(input);
             }
             dispatcher.commands();
-            // Escape belongs to Hex only while something records.
-            let wants_escape = dispatcher.state.wants_escape();
+            // Accepted output remains cancellable after its shortcut releases.
+            let wants_escape = self.status.wants_escape(dispatcher.state.wants_escape());
             if wants_escape && !escape_bound {
                 escape_bound = true;
                 let recording = if dispatcher.state.voice_held {
@@ -884,7 +893,8 @@ impl Backend {
             }
             dispatcher.commands();
             // Keep Escape until its release so the release never reaches the app.
-            let wants_escape = dispatcher.state.wants_escape() || escape_down;
+            let wants_escape =
+                self.status.wants_escape(dispatcher.state.wants_escape()) || escape_down;
             if wants_escape && grabs.escape_grabbed.is_empty() {
                 let available = grabs.grab_escape()?;
                 if self.status.update_escape_availability(available) {
@@ -1298,6 +1308,24 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn pending_output_retains_escape_and_dispatches_cancellation_after_release() {
+        let status = HotkeyStatus::default();
+        let observer = status.clone();
+        let (sender, events) = mpsc::sync_channel(4);
+        let mut dispatcher =
+            Dispatcher::new(&HotkeyOptions::default(), sender, mpsc::channel().1.into());
+        assert!(!observer.wants_escape(dispatcher.state.wants_escape()));
+        status.set_output_pending(true);
+        assert!(observer.wants_escape(dispatcher.state.wants_escape()));
+        dispatcher.input(Input::Escape);
+        assert!(dispatcher.flush().unwrap());
+        assert_eq!(events.try_recv().unwrap(), HotkeyEvent::Cancel);
+        status.set_output_pending(false);
+        assert!(!observer.wants_escape(dispatcher.state.wants_escape()));
+        assert!(observer.wants_escape(true), "recording still owns Escape");
     }
 
     #[test]

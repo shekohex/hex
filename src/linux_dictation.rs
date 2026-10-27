@@ -219,23 +219,29 @@ impl DictationOutput {
             application: context.application.clone(),
             ..Default::default()
         };
+        let modes = self
+            .modes
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         let processing_started = Instant::now();
         let processed = if job.settings.processing != Default::default() {
             let (text, observation) =
                 job.settings
                     .processing
                     .process(&raw_text, context, &job.control.cancelled);
-            crate::dictation_processor::Processed {
+            let mut processed = crate::dictation_processor::Processed {
                 text,
                 observation,
-                transformations: Vec::new(),
-            }
+                transformations: modes.provider_transformations(&snapshot),
+            };
+            processed.apply_transformations(
+                &self.transformations,
+                &snapshot,
+                &job.control.cancelled,
+            );
+            processed
         } else {
-            let modes = self
-                .modes
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
             modes.process_cancellable(
                 &raw_text,
                 &snapshot,
@@ -973,6 +979,7 @@ pub(crate) fn run(
         {
             input.request_open();
         }
+        hotkey_status.set_output_pending(pending > 0);
         indicator.update(capture.is_recording() || start_pending, pending);
         crate::linux_gnome::set_indicator(
             capture.is_recording() || start_pending,
@@ -1084,6 +1091,7 @@ pub(crate) fn run(
     suppressor.restore();
     emit_state(&mut events, VoiceState::Stopping, &device_label)?;
     output.stop.store(true, Ordering::Release);
+    hotkey_status.set_output_pending(false);
     for job in &output.unfinished {
         job.cancel();
     }
@@ -1350,6 +1358,7 @@ mod tests {
     #[test]
     fn cleanup_retry_without_a_display_previews_corrections_without_pasting() {
         let mut settings = AppSettings::default();
+        settings.dictation_processing.default_mode.transformations = vec!["lowercase".into()];
         settings.processing.default_mode.replacements.push(
             crate::text_replacements::TextReplacement {
                 matched_phrase: "hex app".into(),
@@ -1396,7 +1405,10 @@ mod tests {
                 &mut timings,
             )
             .unwrap();
-        assert_eq!(result, "HEX");
+        assert_eq!(
+            result, "hex",
+            "provider correction precedes shared transformations"
+        );
         assert!(timings.paste_ms.is_none());
         assert_eq!(job.control.state.load(Ordering::Acquire), 0);
     }
