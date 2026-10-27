@@ -64,7 +64,7 @@ This environment has `/tmp/.git`, breaking upstream router tests' assumption tha
 temporary folders have no Git ancestor. Router checks pass with a clean
 `/var/tmp` test root. No unrelated temporary Git directory was removed.
 
-Final broad local run: 160 router + 690 app tests passed, with 18 opt-in tests
+Final broad local run: 160 router + 691 app tests passed, with 18 opt-in tests
 ignored and the three proven upstream Mac checks explicitly filtered. The full,
 unfiltered run reports exactly those same three baseline failures. Synthetic
 OCR and private-bus MPRIS checks were subsequently run explicitly and passed.
@@ -75,3 +75,8 @@ the synthetic fixture; MPRIS ran only on a private `dbus-run-session` bus. All
 10 GNOME compositor mocks passed, including hidden/bottom HUD and extra shortcut
 release. The latest debug binary passed the isolated service/provider smoke.
 No configured-gateway probe or physical device/paste test was run.
+
+Final cold-open follow-up preserves one in-flight native open across cancelled
+shortcuts, discards its stale generation, and stops warm recovery once idle
+release applies. The channel-backed regression and full non-baseline suite
+passed; strict all-target/all-feature Clippy passed again. No microphone opened.

@@ -4,13 +4,13 @@ Open **General > Cloud providers > Configure…** in Linux Settings. Local trans
 Cloud selection needs no local model download. GUI and `hex dictate` use saved settings.
 
 ```ts
-Transcription                            // independent of cleanup
+Transcription                            // dictate.providers.linux; independent of cleanup
 ├── Local -> Existing downloaded model
 ├── Cloud -> OpenAI-compatible audio/transcriptions upload
 ├── Stream -> Same upload, streamed transcript response
 └── Realtime -> Intentional recording -> Live audio -> Release -> Commit -> Final
 
-Processing Modes
+Processing Modes                         // modes.providers.linux
 ├── Matching application -> That mode, replacing Global
 └── Otherwise -> Global
     └── Corrections -> Optional cleanup -> One final paste
@@ -80,6 +80,8 @@ Modes replace Global rather than layering. JSON `replacements` entries support
 `matched_phrase` and `output`. Cleanup failure preserves corrected transcription.
 
 ### Last Dictation And Timings
+
+Stable behaviors: `dictate.retry.linux`, `dictate.timings.linux`.
 
 **General > Last dictation** retains one recording in service memory, including
 failed transcription. New accepted recording replaces it. No audio file or
@@ -179,6 +181,14 @@ unauthenticated local-compatible server. Requests never follow redirects.
 
 ### Context And Local OCR
 
+```ts
+Per-recording context                    // modes.context.linux
+├── Clipboard / accessible field -> Bounded snapshot
+├── OCR -> Focused window -> Local text only
+└── Image -> Focused window -> Opted-in vision cleanup
+    └── Unavailable source -> Omit; never whole-desktop fallback
+```
+
 Context defaults off. Only enabled sources go to cleanup, never the speech model.
 Each recording owns its snapshot; context and images are not retained in settings
 or diagnostic events.
@@ -228,6 +238,8 @@ uses a synthetic PNG and Tesseract, never the screen. These do not prove live
 provider availability, desktop context support, or target-app insertion.
 
 ## Native GNOME Wayland
+
+Stable behaviors: `dictate.gnome`, `modes.context.gnome`.
 
 GNOME 49/50 uses the bundled **HEX** Shell extension (`hex@shekohex.dev`). With
 Home Manager, enable `programs.hex.gnomeIntegration = true`; log out and back in
@@ -291,3 +303,9 @@ or GNOME-session proof. Observed verification belongs in the upgrade report.
 Pristine upstream `00f670a` reproduces `general_fits_the_default_window_and_hides_advanced_options` failing with `General scrolls: 733 > 691` after the new Update channel row. The original assertion remains unchanged. Linux Nix packaging excludes only this proven macOS-fixture failure; the normal check script still reports it.
 
 Pristine upstream also fails `platform_goldens` and `experiment_goldens`: `mac-settings-dark`, `mac-settings-sides-dark`, and `shortcut-explainer-toggle-{dark,light}`. Their images remain unchanged. Linux/provider goldens intentionally changed with the provider controls; this does not establish native macOS behavior.
+
+Cold-open admission also retains the old single-worker fence: cancelling an
+in-flight open releases any current input, retains the pending receiver, and
+discards that generation before admitting a newer press's open.
+`audio::tests::idle_release_serializes_cold_opens_and_discards_the_cancelled_generation`
+uses channel-backed inputs without opening a microphone.

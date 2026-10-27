@@ -743,7 +743,7 @@ pub(crate) fn run(
             )?;
             suppressor.restore();
             if release_while_idle {
-                input.close();
+                input.close_idle();
                 audio_ready = false;
             }
             emit_state(
@@ -806,7 +806,7 @@ pub(crate) fn run(
                     // nothing was captured.
                     start_pending = false;
                     suppressor.restore();
-                    input.close();
+                    input.close_idle();
                     audio_ready = false;
                     events.dictation(
                         if action == HotkeyEvent::Cancel {
@@ -846,7 +846,7 @@ pub(crate) fn run(
                     feedback::play(Tone::Cancel);
                     suppressor.restore();
                     if release_while_idle {
-                        input.close();
+                        input.close_idle();
                         audio_ready = false;
                     }
                     events.dictation(DictationPhase::Cancelled, "")?;
@@ -955,6 +955,10 @@ pub(crate) fn run(
             && capture.mark_intentional()
         {
             suppressor.suppress();
+        }
+        if release_while_idle && !capture.is_recording() && !start_pending && finishing.is_none() {
+            input.close_idle();
+            audio_ready = false;
         }
         let intentional_cold_press = start_pending
             && physical_press

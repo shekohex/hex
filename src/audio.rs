@@ -219,6 +219,7 @@ pub struct RecoveringAudioInput {
     active_revision: u64,
     recovery: MicrophoneRecovery,
     replacement: Option<Receiver<InputOpenResult>>,
+    discard_pending_open: bool,
 }
 
 pub enum RecoveringAudioInputEvent {
@@ -514,6 +515,7 @@ impl RecoveringAudioInput {
             active_revision: selection_revision,
             recovery: MicrophoneRecovery::default(),
             replacement: None,
+            discard_pending_open: false,
         }
     }
 
@@ -562,11 +564,24 @@ impl RecoveringAudioInput {
         self.input = Some(input);
     }
 
+    /// Releases a Linux idle microphone without admitting overlapping native
+    /// opens. Keep a cancelled open's receiver until it completes, then discard
+    /// its result; a newer physical press must open its own stream afterwards.
+    #[cfg(target_os = "linux")]
+    pub fn close_idle(&mut self) {
+        if let Some(previous) = self.input.take() {
+            previous.feed_hex_microphone(false);
+        }
+        self.discard_pending_open |= self.replacement.is_some();
+        self.recovery.recovered();
+    }
+
     pub fn close(&mut self) {
         if let Some(previous) = self.input.take() {
             previous.feed_hex_microphone(false);
         }
         self.replacement = None;
+        self.discard_pending_open = false;
         self.recovery.recovered();
     }
 
@@ -588,6 +603,7 @@ impl RecoveringAudioInput {
             return;
         }
         self.replacement = None;
+        self.discard_pending_open = false;
         if self.input.is_none() {
             self.recovery.recovered();
         }
@@ -618,6 +634,9 @@ impl RecoveringAudioInput {
     ) -> RecoveringAudioInputEvent {
         let now = Instant::now();
         if let Some((opened_revision, result)) = self.poll_replacement() {
+            if std::mem::take(&mut self.discard_pending_open) {
+                return RecoveringAudioInputEvent::Timeout;
+            }
             let target_revision = self
                 .recovery
                 .target_revision
@@ -697,6 +716,7 @@ impl RecoveringAudioInput {
     }
 
     fn start_replacement(&mut self) {
+        self.discard_pending_open = false;
         let revision = self
             .recovery
             .target_revision
@@ -1013,6 +1033,47 @@ fn captured_through(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_release_serializes_cold_opens_and_discards_the_cancelled_generation() {
+        let (mut input, first) = RecoveringAudioInput::pending_for_test();
+        input.close_idle();
+        input.request_open();
+        assert!(
+            input.is_opening(),
+            "keep the old receiver rather than spawn another native open"
+        );
+        let (stale, _) = AudioInput::channel_for_test();
+        assert!(first.send((0, Ok(stale))).is_ok());
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        assert!(
+            !input.is_open(),
+            "old press must not supply the newer capture"
+        );
+        assert!(!input.is_opening());
+        let (sender, receiver) = mpsc::channel();
+        input.replacement = Some(receiver);
+        let (fresh, _) = AudioInput::channel_for_test();
+        assert!(sender.send((0, Ok(fresh))).is_ok());
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        assert!(input.is_open());
+        input.close_idle();
+        assert!(!input.is_open());
+        let mut recovering = RecoveringAudioInput::failed_for_test("cancelled cold input");
+        assert!(recovering.is_recovering());
+        recovering.close_idle();
+        assert!(
+            !recovering.is_active(),
+            "idle release must stop warm recovery retries"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
