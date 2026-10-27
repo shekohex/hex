@@ -31,6 +31,8 @@ use crate::linux_input::ShortcutCommand;
 /// version error and exit.
 const VERSION: u32 = 2;
 const MAX_FRAME: usize = 128 * 1024;
+// A 2 MiB transcript can expand sixfold when JSON-escaped. Audio never crosses IPC.
+const MAX_REPLY_FRAME: usize = 16 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENTS: usize = 8;
 const UNIT: &str = "hex.service";
@@ -51,6 +53,14 @@ pub(crate) enum Request {
     /// A `hex dictation`, `hex voice-action`, or `hex paste-last` command.
     Shortcut(ShortcutCommand),
     Status,
+    ConfigureProviders(Box<crate::linux_pipeline::ProviderConfiguration>),
+    RetryLast {
+        id: u64,
+        cleanup_only: bool,
+    },
+    ClearLast {
+        id: u64,
+    },
     /// Drain accepted work and exit.
     Quit,
 }
@@ -84,6 +94,8 @@ impl Activation {
 /// What `hex status` prints and every reply carries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Status {
+    #[serde(default)]
+    pub(crate) last_dictation: Option<crate::linux_last_dictation::Snapshot>,
     pub(crate) desktop: DesktopSnapshot,
     pub(crate) settings: crate::app_settings::AppSettings,
     pub(crate) editing: bool,
@@ -150,6 +162,7 @@ pub(crate) fn route_shortcut(
 pub(crate) struct Published {
     pub(crate) status: Mutex<Option<Status>>,
     pub(crate) shortcuts: Mutex<Option<ShortcutRoute>>,
+    pub(crate) host: Mutex<Option<crate::linux_app::HostHandle>>,
 }
 
 /// Requests for the main thread, which owns the window.
@@ -221,11 +234,15 @@ fn read_exact(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) 
 }
 
 fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+    read_frame_bounded(stream, MAX_FRAME)
+}
+
+fn read_frame_bounded<T: DeserializeOwned>(stream: &mut UnixStream, limit: usize) -> Result<T> {
     let deadline = Instant::now() + IO_TIMEOUT;
     let mut header = [0; 4];
     read_exact(stream, &mut header, deadline)?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_FRAME {
+    if length == 0 || length > limit {
         bail!("Invalid Hex frame size");
     }
     let mut body = vec![0; length];
@@ -234,8 +251,16 @@ fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
 }
 
 fn write_frame<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
+    write_frame_bounded(stream, message, MAX_FRAME)
+}
+
+fn write_frame_bounded<T: Serialize>(
+    stream: &mut UnixStream,
+    message: &T,
+    limit: usize,
+) -> Result<()> {
     let body = serde_json::to_vec(message)?;
-    if body.len() > MAX_FRAME {
+    if body.len() > limit {
         bail!("Hex message exceeds the size limit");
     }
     let deadline = Instant::now() + IO_TIMEOUT;
@@ -313,7 +338,8 @@ pub(crate) fn request(request: Request) -> std::result::Result<Status, RequestEr
         },
     )
     .map_err(RequestError::Failed)?;
-    let reply: Reply = read_frame(&mut stream).map_err(RequestError::Failed)?;
+    let reply: Reply =
+        read_frame_bounded(&mut stream, MAX_REPLY_FRAME).map_err(RequestError::Failed)?;
     if reply.version != VERSION {
         return Err(RequestError::Outdated);
     }
@@ -435,13 +461,14 @@ fn serve_client(
         .then(|| serde_json::from_value::<Message>(frame).ok())
         .flatten();
         let Some(message) = message else {
-            let _ = write_frame(
+            let _ = write_frame_bounded(
                 &mut stream,
                 &Reply {
                     version: VERSION,
                     status: None,
                     error: Some("Unsupported Hex request; restart Hex".into()),
                 },
+                MAX_REPLY_FRAME,
             );
             break;
         };
@@ -464,6 +491,18 @@ fn serve_client(
                 route_shortcut(published.shortcuts.lock().unwrap().as_ref(), command)
             }
             Request::Status => Ok(()),
+            request @ (Request::ConfigureProviders(_)
+            | Request::RetryLast { .. }
+            | Request::ClearLast { .. }) => {
+                let host = published.host.lock().unwrap().clone();
+                host.ok_or_else(|| eyre!("Hex is starting; try again"))
+                    .and_then(|host| {
+                        host.provider_request(request)?;
+                        *published.status.lock().unwrap() =
+                            Some(host.status(host.snapshot(), session.clone()));
+                        Ok(())
+                    })
+            }
             Request::Quit => {
                 shutdown.store(true, Ordering::Release);
                 // The host thread also wakes the main thread when it sees the flag.
@@ -477,13 +516,14 @@ fn serve_client(
             (Ok(()), None) => Some("Hex is starting; try again".into()),
             (Ok(()), Some(_)) => None,
         };
-        if write_frame(
+        if write_frame_bounded(
             &mut stream,
             &Reply {
                 version: VERSION,
                 status,
                 error,
             },
+            MAX_REPLY_FRAME,
         )
         .is_err()
         {

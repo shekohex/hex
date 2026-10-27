@@ -367,3 +367,10 @@ same-user socket permissions, version-1 clients get an error, invalid,
 oversized, and stalled frames, crash/stale-socket recovery, two racing launches
 yield one Hex, `hex quit` drains and removes the socket, and a custom data
 directory never runs `systemctl`.
+
+## Fork Cloud Providers
+
+General > Cloud providers > Configure… selects cloud ASR independently of cleanup.
+Batch, streamed responses, and live realtime/VAD are supported. Local remains default.
+See [cloud providers](features/cloud.md) for protocols, credentials, context,
+thinking, last-result retry, GNOME setup, and CLI configuration.

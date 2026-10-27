@@ -52,6 +52,10 @@ impl Picker {
     }
 
     pub(super) fn selected_installed(&self, settings: &AppSettings) -> bool {
+        #[cfg(target_os = "linux")]
+        if settings.cloud_transcription.is_some() {
+            return true;
+        }
         transcription_models::validate(&settings.transcription)
             .is_ok_and(|model| self.installed(model, &settings.transcription.language))
     }

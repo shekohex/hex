@@ -35,11 +35,22 @@ impl ModeRuntime {
 
     /// Global replacements, then the matching mode's corrections,
     /// post-processing, and transformations.
+    #[cfg(any(test, target_os = "windows"))]
     pub fn process(
         &self,
         raw_text: &str,
         context: &crate::context::ContextSnapshot,
         transformations: &crate::personal_commands::TransformationClient,
+    ) -> Processed {
+        self.process_cancellable(raw_text, context, transformations, &AtomicBool::new(false))
+    }
+
+    pub fn process_cancellable(
+        &self,
+        raw_text: &str,
+        context: &crate::context::ContextSnapshot,
+        transformations: &crate::personal_commands::TransformationClient,
+        cancelled: &AtomicBool,
     ) -> Processed {
         let text = self.replacements.replace(raw_text);
         let mode = mode_for_context(
@@ -58,9 +69,8 @@ impl ModeRuntime {
             },
             Profile::from_mode,
         );
-        let cancelled = AtomicBool::new(false);
-        let mut processed = Profiles::new(profile).process_cancellable(&text, context, &cancelled);
-        processed.apply_transformations(transformations, context, &cancelled);
+        let mut processed = Profiles::new(profile).process_cancellable(&text, context, cancelled);
+        processed.apply_transformations(transformations, context, cancelled);
         processed
     }
 }

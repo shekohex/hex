@@ -882,6 +882,20 @@ impl DictationCapture {
         self.ring.extend(samples);
     }
 
+    /// Intentional, normalized audio already available for a nonblocking upstream projection.
+    #[cfg(target_os = "linux")]
+    pub fn live_samples_from(&self, offset: usize) -> &[f32] {
+        let Some(recording) = self
+            .recording
+            .as_ref()
+            .filter(|recording| recording.intentional)
+        else {
+            return &[];
+        };
+        let delay = recording.resampler.as_ref().map_or(0, Fft::output_delay);
+        &recording.samples[(delay + offset).min(recording.samples.len())..]
+    }
+
     pub fn is_recording(&self) -> bool {
         self.recording.is_some()
     }

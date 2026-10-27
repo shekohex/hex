@@ -109,6 +109,26 @@ with tempfile.TemporaryDirectory(prefix="hex-instance-", dir=os.environ.get("TMP
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert stat.S_IMODE(support.stat().st_mode) == 0o700
 
+        # Provider edits never enable a disabled listener or require a display/model.
+        configuration = root / "providers.json"
+        configuration.write_text(json.dumps({"cloud_transcription": {
+            "model": "mock-asr", "mode": "realtime", "server_vad": True,
+            "connection": {"base_url": "http://127.0.0.1:9/v1", "api_key_env": "HEX_TEST_KEY"},
+        }}))
+        configured = run("providers", "configure", str(configuration))
+        assert configured.returncode == 0, configured.stderr
+        current = run("providers", "show")
+        provider = json.loads(current.stdout)
+        assert provider["cloud_transcription"]["model"] == "mock-asr"
+        assert provider["cloud_transcription"]["server_vad"] is True
+        assert status()["desktop"]["listener"]["running"] is False
+        assert stat.S_IMODE((support / "settings.json").stat().st_mode) == 0o600
+        assert json.loads(run("last", "show").stdout) is None
+        assert run("last", "retry").returncode != 0
+        configuration.write_text('{"cloud_transcription":{"model":""}}')
+        assert run("providers", "configure", str(configuration)).returncode != 0
+        assert status()["settings"]["cloud_transcription"]["model"] == "mock-asr"
+
         # A second launch forwards and exits 0, leaving the same instance.
         for command in (["start"], ["app", "--hidden"], ["service"]):
             forwarded = run(*command)

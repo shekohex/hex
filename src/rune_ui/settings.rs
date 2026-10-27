@@ -402,6 +402,11 @@ pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
     if !ui.records_shortcuts() {
         content = content.child(desktop_commands(ui, p));
     }
+    #[cfg(target_os = "linux")]
+    if ui.platform.caps.os == super::platform::Os::Linux {
+        content = content.children(super::providers::last_result(ui, p));
+        content = content.child(super::providers::view(ui, p));
+    }
     content = content
         .child(dictation_section(ui, p, layer))
         .children(
@@ -778,6 +783,11 @@ fn dictation_section(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         transcription_models::language_name(&selection.language),
         model.name
     );
+    #[cfg(target_os = "linux")]
+    let label = settings
+        .cloud_transcription
+        .as_ref()
+        .map_or(label, |cloud| format!("Cloud · {}", cloud.model));
     let language = selection.language.clone();
     rows.push(
         described_row(

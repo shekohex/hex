@@ -14,6 +14,8 @@ mod audio;
 mod calendar;
 #[cfg(hex_capture)]
 mod capture_host;
+#[cfg(target_os = "linux")]
+mod cloud;
 #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
 mod command_grammar;
 #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
@@ -76,11 +78,19 @@ mod linux_dictation;
 #[cfg(target_os = "linux")]
 mod linux_file_chooser;
 #[cfg(target_os = "linux")]
+mod linux_gnome;
+#[cfg(target_os = "linux")]
 mod linux_input;
+#[cfg(target_os = "linux")]
+mod linux_last_dictation;
+#[cfg(target_os = "linux")]
+mod linux_media;
 #[cfg(target_os = "linux")]
 mod linux_migration;
 #[cfg(target_os = "linux")]
 mod linux_paste;
+#[cfg(target_os = "linux")]
+mod linux_pipeline;
 #[cfg(target_os = "linux")]
 mod linux_portal;
 #[cfg(target_os = "linux")]

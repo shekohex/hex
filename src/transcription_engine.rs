@@ -265,13 +265,27 @@ pub struct PendingTranscript {
 }
 
 impl PendingTranscript {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn wait(self) -> Result<Transcribed, String> {
+        self.wait_inner(None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn wait_cancellable(self, cancelled: &AtomicBool) -> Result<Transcribed, String> {
+        self.wait_inner(Some(cancelled))
+    }
+
+    fn wait_inner(self, cancelled: Option<&AtomicBool>) -> Result<Transcribed, String> {
         let mut stream_deadline = self
             .stream_cancel
             .as_ref()
             .map(|_| Instant::now() + self.stream_finish);
         let mut job_deadline: Option<Instant> = None;
         loop {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                self.abandon();
+                return Err("dictation was cancelled".into());
+            }
             let now = Instant::now();
             let timeout = [stream_deadline, job_deadline]
                 .into_iter()
@@ -885,6 +899,40 @@ fn finish_stream(stream: &mut impl StreamFeed, clip: &[f32], fed: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancelling_a_wait_aborts_only_that_job_without_stalling_the_engine() {
+        let (engine, commands) = TranscriptionEngine::for_test_without_streaming();
+        let first = engine.finish(None, vec![0.1; 16]).unwrap();
+        let Command::Finish { job, .. } = commands.recv().unwrap() else {
+            panic!("finish")
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag.store(true, Ordering::Release);
+        });
+        assert_eq!(
+            first.wait_cancellable(&cancelled).unwrap_err(),
+            "dictation was cancelled"
+        );
+        signal.join().unwrap();
+        assert!(job.cancel.is_cancelled());
+        assert!(!engine.stalled.load(Ordering::Acquire));
+        let second = engine.finish(None, vec![0.2; 16]).unwrap();
+        let Command::Finish { job, .. } = commands.recv().unwrap() else {
+            panic!("finish")
+        };
+        assert!(!job.cancel.is_cancelled());
+        job.finish(Ok(Transcribed {
+            text: "next".into(),
+            source: Source::Offline,
+            finish_ms: 1,
+        }));
+        assert_eq!(second.wait().unwrap().text, "next");
+    }
 
     #[test]
     fn source_labels_distinguish_fallbacks() {

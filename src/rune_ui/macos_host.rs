@@ -1688,6 +1688,7 @@ mod tests {
                 text: String::new(),
                 processing: None,
                 reason: None,
+                timings: None,
             })
             .unwrap()
                 + "\n"

@@ -11,7 +11,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use rune::{Availability, Cx, El, OverlayHandle, OverlaySpec, ScreenEdge, row, text};
+use rune::{Availability, Cx, El, OverlayHandle, OverlaySpec, ScreenEdge, col, row, text};
 
 use crate::app_settings::IndicatorPosition;
 
@@ -67,6 +67,7 @@ impl Drop for LinuxIndicator {
 #[derive(Default)]
 struct Hud {
     state: IndicatorState,
+    transcript: String,
 }
 
 /// The newest listener's report; an older listener's reports stop counting.
@@ -76,6 +77,7 @@ struct Slot {
     position: IndicatorPosition,
     /// What the overlay was last asked to show.
     shown: Option<(IndicatorState, IndicatorPosition)>,
+    shown_text: String,
 }
 
 impl Slot {
@@ -85,6 +87,7 @@ impl Slot {
             state: IndicatorState::Hidden,
             position: IndicatorPosition::Top,
             shown: None,
+            shown_text: String::new(),
         }
     }
 }
@@ -137,20 +140,28 @@ fn apply(slot: &mut Slot) {
         return;
     };
     let desired = (slot.state, slot.position);
-    if slot.shown == Some(desired) {
+    let transcript = live_transcript();
+    if slot.shown == Some(desired) && slot.shown_text == transcript {
         return;
     }
     let was_hidden = slot
         .shown
         .is_none_or(|(state, _)| state == IndicatorState::Hidden);
     slot.shown = Some(desired);
+    slot.shown_text = transcript.clone();
     let (state, position) = desired;
     if state == IndicatorState::Hidden || position == IndicatorPosition::Hidden {
         overlay.hide();
         return;
     }
+    overlay.resize(if transcript.is_empty() {
+        SIZE
+    } else {
+        (620.0, 88.0)
+    });
     overlay.update(move |hud, tx| {
         hud.state = state;
+        hud.transcript = transcript;
         tx.instant();
     });
     if was_hidden {
@@ -164,6 +175,9 @@ fn apply(slot: &mut Slot) {
 
 /// Why the HUD can't show, once Rune has tried.
 pub(crate) fn limitation() -> Option<String> {
+    if crate::linux_gnome::is_gnome() {
+        return None;
+    }
     let overlay = OVERLAY.get()?;
     (overlay.availability() == Availability::Unavailable).then(|| {
         "Recording HUD unavailable: this compositor does not support Wayland layer-shell. Dictation still works.".into()
@@ -175,12 +189,16 @@ fn view(hud: &Hud, _: &mut Cx<Hud>) -> El {
         IndicatorState::Processing => "Transcribing",
         _ => "Recording",
     });
-    // A dark pill in either appearance: #171717 on a #292929 hairline, #eeeeee 600 13px.
     row().key("hud").w_full().h_full().center().child(
-        row()
+        col()
             .key("pill")
-            .h(36.0)
+            .h(if hud.transcript.is_empty() {
+                36.0
+            } else {
+                76.0
+            })
             .px(18.0)
+            .gap(4.0)
             .center()
             .radius(18.0)
             .fill(srgb(0x171717))
@@ -190,7 +208,15 @@ fn view(hud: &Hud, _: &mut Cx<Hud>) -> El {
                     .key("label")
                     .font(rune::TextStyle::new(13.0, 600.0))
                     .color(srgb(0xeeeeee)),
-            ),
+            )
+            .children((!hud.transcript.is_empty()).then(|| {
+                text(&hud.transcript)
+                    .key("transcript")
+                    .max_w(560.0)
+                    .wrap()
+                    .font(rune::TextStyle::new(13.0, 400.0))
+                    .color(srgb(0xeeeeee))
+            })),
     )
 }
 
@@ -201,5 +227,74 @@ fn srgb(hex: u32) -> rune::Color {
         g: channel(8),
         b: channel(0),
         a: 1.0,
+    }
+}
+
+#[derive(Default)]
+struct LiveTranscript {
+    generation: u64,
+    text: String,
+}
+static LIVE_TRANSCRIPT: Mutex<LiveTranscript> = Mutex::new(LiveTranscript {
+    generation: 0,
+    text: String::new(),
+});
+
+pub(crate) fn live_transcript() -> String {
+    LIVE_TRANSCRIPT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .text
+        .clone()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Preview(u64);
+impl Preview {
+    pub(crate) fn acquire() -> Self {
+        let mut preview = LIVE_TRANSCRIPT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        preview.generation = preview.generation.wrapping_add(1);
+        preview.text.clear();
+        Self(preview.generation)
+    }
+    pub(crate) fn update(self, text: &str) {
+        let mut preview = LIVE_TRANSCRIPT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if preview.generation != self.0 {
+            return;
+        }
+        // Keep the most recent 120 characters, matching the GNOME preview.
+        let start = text
+            .char_indices()
+            .rev()
+            .nth(119)
+            .map_or(0, |(offset, _)| offset);
+        preview.text = text[start..]
+            .chars()
+            .map(|character| {
+                if character.is_whitespace() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn a_new_capture_fences_older_jobs_and_bounds_unicode_previews() {
+        let older = Preview::acquire();
+        older.update("old");
+        let newer = Preview::acquire();
+        newer.update(&"界".repeat(150));
+        older.update("stale");
+        assert_eq!(live_transcript(), "界".repeat(120));
     }
 }

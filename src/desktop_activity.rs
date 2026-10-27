@@ -230,6 +230,7 @@ mod tests {
                 text: String::new(),
                 processing: None,
                 reason: None,
+                timings: None,
             },
             VoiceEvent::Dictation {
                 timestamp_ms: 3,
@@ -237,6 +238,7 @@ mod tests {
                 text: String::new(),
                 processing: None,
                 reason: None,
+                timings: None,
             },
         ];
         assert_eq!(

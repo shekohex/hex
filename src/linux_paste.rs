@@ -33,12 +33,14 @@ enum Backend {
     /// `wtype`'s virtual keyboard carries its own modifiers, so keys the
     /// user still holds never turn its Ctrl+V into another chord.
     Wayland,
+    Gnome,
 }
 
 impl LinuxPaster {
     pub(crate) fn new(stop: Arc<AtomicBool>, paste_with_shift: Arc<AtomicBool>) -> Result<Self> {
         let backend = match LinuxSession::detect() {
             LinuxSession::X11 => Backend::X11(Box::new(X11Paster::new()?)),
+            LinuxSession::Wayland if crate::linux_gnome::is_gnome() => Backend::Gnome,
             LinuxSession::Wayland => Backend::Wayland,
         };
         Ok(Self {
@@ -64,6 +66,7 @@ impl LinuxPaster {
                     )
                     .ok()?
             }
+            Backend::Gnome => return None,
             Backend::Wayland => {
                 let output = Command::new("wl-paste")
                     .args(["--primary", "--no-newline", "--type", "text/plain"])
@@ -79,22 +82,38 @@ impl LinuxPaster {
     }
 
     pub(crate) fn paste(&mut self, text: &str) -> Result<()> {
+        self.paste_with_commit(text, &self.stop.clone(), || Ok(()))
+    }
+
+    pub(crate) fn paste_with_commit(
+        &mut self,
+        text: &str,
+        cancelled: &AtomicBool,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.stop.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+            return Err(eyre!("Paste cancelled"));
+        }
         if text.trim().is_empty() {
             return Err(eyre!("refusing to paste an empty transcript"));
         }
         let paste_with_shift = self.paste_with_shift.load(Ordering::Relaxed);
         match &mut self.backend {
-            Backend::X11(paster) => paster.paste(text, &self.stop, paste_with_shift)?,
+            Backend::X11(paster) => {
+                paster.paste_with_commit(text, cancelled, paste_with_shift, commit)?
+            }
+            Backend::Gnome => crate::linux_gnome::paste(text, paste_with_shift, cancelled, commit)?,
             Backend::Wayland => {
                 let mut copy = Command::new("wl-copy");
                 copy.args(["--type", "text/plain;charset=utf-8"]);
-                run_helper(copy, text.as_bytes(), &self.stop, HELPER_TIMEOUT)
+                run_helper(copy, text.as_bytes(), cancelled, HELPER_TIMEOUT)
                     .wrap_err("could not own the Wayland clipboard; install wl-clipboard and check compositor support")?;
                 // wl-copy's parent exits only after the selection is installed.
                 // Never read a pipe inherited by its clipboard-serving daemon.
+                commit()?;
                 let mut keys = Command::new("wtype");
                 keys.args(paste_keys(paste_with_shift));
-                run_helper(keys, &[], &self.stop, HELPER_TIMEOUT)
+                run_helper(keys, &[], cancelled, HELPER_TIMEOUT)
                     .wrap_err("could not send the Wayland paste shortcut; install wtype and use a compositor supporting virtual keyboards")?;
             }
         }
@@ -128,8 +147,15 @@ impl X11Paster {
         })
     }
 
-    fn paste(&mut self, text: &str, stop: &AtomicBool, paste_with_shift: bool) -> Result<()> {
+    fn paste_with_commit(
+        &mut self,
+        text: &str,
+        stop: &AtomicBool,
+        paste_with_shift: bool,
+        commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.wait_for_modifier_release(stop)?;
+        commit()?;
         let atoms = &self.clipboard.getter.atoms;
         self.clipboard
             .store(atoms.clipboard, atoms.utf8_string, text.as_bytes())

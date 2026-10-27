@@ -184,6 +184,18 @@ const KEYS: &[Key] = &[
         "Recently used models, each with its language and hints",
         "Hex records these as you switch models",
     ),
+    #[cfg(target_os = "linux")]
+    optional(
+        "cloud_transcription",
+        Kind::Json,
+        "Cloud ASR connection and transport; none selects local transcription",
+    ),
+    #[cfg(target_os = "linux")]
+    key(
+        "processing",
+        Kind::Json,
+        "Direct-provider cleanup modes, corrections, thinking, and context",
+    ),
     key(
         "dictation_processing.default_mode",
         Kind::Json,
@@ -614,6 +626,12 @@ pub fn apply(
                     &format!("{} doesn't take recognition hints", model.name),
                 ));
             }
+        }
+        #[cfg(target_os = "linux")]
+        "cloud_transcription" | "processing" => {
+            candidate
+                .validate_providers()
+                .map_err(|error| invalid(name, &error.to_string()))?;
         }
         "dictation_processing.default_mode" => {
             candidate.dictation_processing.default_mode.name = "Global".into();

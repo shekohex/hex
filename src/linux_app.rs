@@ -231,8 +231,10 @@ impl HostHandle {
     /// Saves the window's settings, then adopts them. A failed save leaves
     /// the host's settings alone.
     pub(crate) fn save_settings(&self, settings: AppSettings) -> Result<()> {
+        let mut host = self.lock();
         settings.save()?;
-        self.lock().adopt_settings(settings);
+        host.adopt_settings(settings);
+        drop(host);
         self.wake();
         Ok(())
     }
@@ -272,8 +274,37 @@ impl HostHandle {
         }
     }
 
-    fn status(&self, snapshot: HostSnapshot, session: linux_service::Session) -> Status {
+    pub(crate) fn provider_request(&self, request: linux_service::Request) -> Result<()> {
+        match request {
+            linux_service::Request::ConfigureProviders(configuration) => {
+                configuration.validate()?;
+                let mut host = self.lock();
+                let mut settings = host.settings.clone();
+                settings.cloud_transcription = configuration.cloud_transcription;
+                settings.processing = configuration.processing;
+                settings.save()?;
+                host.adopt_settings(settings);
+                drop(host);
+                self.wake();
+                Ok(())
+            }
+            linux_service::Request::RetryLast { id, cleanup_only } => self
+                .lock()
+                .output
+                .last
+                .request(crate::linux_last_dictation::Retry { id, cleanup_only }),
+            linux_service::Request::ClearLast { id } => self.lock().output.last.clear(id),
+            _ => Err(color_eyre::eyre::eyre!("Not a provider request")),
+        }
+    }
+
+    pub(crate) fn last_dictation(&self) -> Option<crate::linux_last_dictation::Snapshot> {
+        self.lock().output.last.snapshot()
+    }
+
+    pub(crate) fn status(&self, snapshot: HostSnapshot, session: linux_service::Session) -> Status {
         Status {
+            last_dictation: self.last_dictation(),
             desktop: snapshot.desktop,
             settings: snapshot.settings,
             editing: snapshot.editing,
@@ -319,6 +350,7 @@ pub(crate) fn run(
     let host = HostHandle::new(host, shutdown);
     let session = linux_service::Session::current();
     let published = Arc::new(Published::default());
+    *published.host.lock().unwrap() = Some(host.clone());
     *published.status.lock().unwrap() = Some(host.status(host.snapshot(), session.clone()));
     let (control, requests) = mpsc::sync_channel(8);
     server.serve(published.clone(), control.clone(), shutdown);
@@ -525,7 +557,11 @@ impl LinuxDesktopHost {
             return;
         }
         let model = crate::transcription_models::definition(self.settings.transcription.model);
-        if !crate::transcription_models::is_installed(model, &self.settings.transcription.language)
+        if self.settings.cloud_transcription.is_none()
+            && !crate::transcription_models::is_installed(
+                model,
+                &self.settings.transcription.language,
+            )
         {
             self.status = "Model required".into();
             return;
@@ -602,7 +638,10 @@ impl LinuxDesktopHost {
                 match result {
                     Ok(prepared) => {
                         let selection = prepared.selection.clone();
-                        match save_with(|settings| settings.remember_transcription(selection)) {
+                        match save_with(|settings| {
+                            settings.remember_transcription(selection);
+                            settings.cloud_transcription = None;
+                        }) {
                             Ok(candidate) => {
                                 self.settings = candidate;
                                 self.settings_valid = true;
@@ -726,6 +765,9 @@ impl LinuxDesktopHost {
             return;
         }
         let was_valid = self.settings_valid;
+        if settings.cloud_transcription != self.settings.cloud_transcription {
+            self.cancel_transcription_preparation();
+        }
         self.settings = settings;
         self.settings_valid = true;
         self.settings_error = None;

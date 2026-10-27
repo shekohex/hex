@@ -1254,6 +1254,10 @@ pub struct AppSettings {
     pub paste_last_hotkey: Option<HotkeyBinding>,
     pub show_dock_icon: bool,
     pub transcription: TranscriptionSelection,
+    #[cfg(target_os = "linux")]
+    pub cloud_transcription: Option<crate::cloud::TranscriptionSettings>,
+    #[cfg(target_os = "linux")]
+    pub processing: crate::linux_pipeline::PipelineSettings,
     pub transcription_recents: Vec<TranscriptionSelection>,
     pub dictation_processing: DictationProcessingSettings,
     pub voice_action: VoiceActionSettings,
@@ -1333,6 +1337,10 @@ impl Default for AppSettings {
             paste_last_hotkey: Some(HotkeyBinding::paste_last_default()),
             show_dock_icon: true,
             transcription: default_transcription(),
+            #[cfg(target_os = "linux")]
+            cloud_transcription: None,
+            #[cfg(target_os = "linux")]
+            processing: Default::default(),
             transcription_recents: Vec::new(),
             dictation_processing: DictationProcessingSettings::default(),
             voice_action: VoiceActionSettings::default(),
@@ -1485,6 +1493,21 @@ impl AppSettings {
     pub fn load() -> Result<Self> {
         let path = path()?;
         migrate_legacy_settings(&path)?;
+        #[cfg(target_os = "linux")]
+        if !path.exists()
+            && let Some(seed) = std::env::var_os("HEX_INITIAL_SETTINGS_FILE")
+        {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::open(seed)?
+                .take(112 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 112 * 1024 {
+                return Err(eyre!("Initial Linux settings exceed 112 KiB"));
+            }
+            let settings = crate::linux_migration::initial_settings(&bytes)?;
+            settings.write_to(&path)?;
+        }
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut settings = Self::load_from(&path)?;
         #[cfg(target_os = "macos")]
@@ -1626,6 +1649,8 @@ impl AppSettings {
                 settings.normalize_transcription_recents();
                 crate::transcription_models::validate(&settings.transcription)?;
                 settings.repair_hotkey_conflict();
+                #[cfg(target_os = "linux")]
+                settings.validate_providers()?;
                 if serde_json::to_value(&settings)? != loaded
                     && let Err(error) = settings.write_to(path)
                 {
@@ -1645,8 +1670,22 @@ impl AppSettings {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_providers(&self) -> Result<()> {
+        if let Some(cloud) = &self.cloud_transcription {
+            cloud.validate()?;
+        }
+        self.processing.validate()?;
+        if serde_json::to_vec(self)?.len() > 112 * 1024 {
+            return Err(eyre!("Settings exceed the service snapshot limit"));
+        }
+        Ok(())
+    }
+
     fn write_to(&self, path: &std::path::Path) -> Result<()> {
         self.validate_microphone_policy()?;
+        #[cfg(target_os = "linux")]
+        self.validate_providers()?;
         let parent = path
             .parent()
             .ok_or_else(|| eyre!("settings path has no parent"))?;
@@ -1657,6 +1696,22 @@ impl AppSettings {
             crate::onboarding::record_pending_at(parent)?;
         }
         let temporary = settings_temporary_path(path);
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            file.write_all(&serde_json::to_vec_pretty(self)?)?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
         fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
         fs::rename(temporary, path)?;
         Ok(())

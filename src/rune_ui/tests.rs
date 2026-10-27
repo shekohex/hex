@@ -1340,3 +1340,29 @@ fn goldens() {
 }
 
 mod panes;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_drafts_only_change_settings_on_save() {
+    let mut rt = runtime("providers", true, (1100.0, 3000.0));
+    let original = rt.state.settings.clone();
+    tap(&mut rt, "cloud-enabled");
+    assert_eq!(rt.state.settings, original);
+    tap(&mut rt, "save-providers");
+    assert!(rt.state.settings.cloud_transcription.is_none());
+    assert_eq!(rt.state.settings.processing, original.processing);
+    assert_eq!(
+        rt.state.settings.dictation_hotkey,
+        original.dictation_hotkey
+    );
+    assert_eq!(saved(&rt), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_editor_goldens() {
+    let _goldens = Goldens::collect();
+    for dark in [true, false] {
+        check_golden("providers", dark, (1100.0, 2400.0));
+    }
+}

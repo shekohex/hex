@@ -33,6 +33,8 @@ mod onboarding;
 mod picker;
 mod platform;
 mod platform_settings;
+#[cfg(target_os = "linux")]
+mod providers;
 #[cfg(hex_capture)]
 mod scrawl;
 mod settings;
@@ -539,6 +541,8 @@ pub(crate) struct Ui {
     /// General's Advanced disclosure is open.
     advanced: bool,
     capture: Capture,
+    #[cfg(target_os = "linux")]
+    providers: providers::Providers,
     hints: TextEdit,
     vocabulary: vocabulary::VocabularyEditor,
     /// The model the service was last seen preparing, and since when.
@@ -617,6 +621,8 @@ impl Ui {
             confirm_release: false,
             advanced: false,
             capture: Capture::Idle,
+            #[cfg(target_os = "linux")]
+            providers: Default::default(),
             hints,
             vocabulary,
             preparing: None,
@@ -1045,6 +1051,10 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     changed |= onboarding::poll(ui);
+    #[cfg(target_os = "linux")]
+    {
+        changed |= providers::poll(ui);
+    }
     let visible = ui.window.as_ref().is_none_or(rune::AppHandle::is_visible);
     changed |= explainer::poll(ui, clock, visible, tx);
     changed | settings::advance_capture(ui, clock, tx)
@@ -1453,6 +1463,11 @@ const SCENES: &[Scene] = &[
         poll(ui, 0.0, &mut Tx::default());
     }),
     ("portal", |ui| *ui = portal_fixture()),
+    #[cfg(target_os = "linux")]
+    ("providers", |ui| {
+        *ui = portal_fixture();
+        providers::fixture(ui);
+    }),
     ("commands", |ui| *ui = fixture(DesktopShortcuts::Commands)),
     ("disabled", |ui| {
         *ui = portal_fixture();

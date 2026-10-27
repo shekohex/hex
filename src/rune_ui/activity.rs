@@ -83,6 +83,7 @@ impl ActivityPane {
                     fallback: None,
                 }),
                 reason: None,
+                timings: None,
             },
             VoiceEvent::Dictation {
                 timestamp_ms: at(6),
@@ -90,6 +91,7 @@ impl ActivityPane {
                 text: String::new(),
                 processing: None,
                 reason: None,
+                timings: None,
             },
             VoiceEvent::Transcript {
                 timestamp_ms: at(6),
@@ -103,6 +105,7 @@ impl ActivityPane {
                 text: String::new(),
                 processing: None,
                 reason: None,
+                timings: None,
             },
             VoiceEvent::Context {
                 timestamp_ms: at(12),

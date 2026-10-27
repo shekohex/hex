@@ -5,12 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::app_settings::{AppSettings, HotkeyBinding};
 use crate::linux_input::LinuxHotkey;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(default)]
 struct LegacySettings {
     dictation_hotkey: LinuxHotkey,
@@ -20,6 +20,10 @@ struct LegacySettings {
     paste_with_shift: bool,
     sound_effect_volume: f32,
     transcription: crate::transcription_models::TranscriptionSelection,
+    release_microphone_while_idle: bool,
+    pause_media_while_recording: bool,
+    cloud_transcription: Option<crate::cloud::TranscriptionSettings>,
+    processing: crate::linux_pipeline::PipelineSettings,
 }
 
 impl Default for LegacySettings {
@@ -30,6 +34,10 @@ impl Default for LegacySettings {
             shortcut_mode: crate::dictation::ShortcutMode::Hold,
             paste_with_shift: true,
             sound_effect_volume: 0.5,
+            release_microphone_while_idle: false,
+            pause_media_while_recording: false,
+            cloud_transcription: None,
+            processing: Default::default(),
             transcription: crate::transcription_models::TranscriptionSelection::default(),
         }
     }
@@ -48,7 +56,56 @@ impl LegacySettings {
             settings.sound_effect_volume = volume;
         }
         settings.transcription = self.transcription;
+        settings.release_microphone_while_idle = self.release_microphone_while_idle;
+        if self.pause_media_while_recording {
+            settings.recording_audio_behavior =
+                crate::app_settings::RecordingAudioBehavior::PauseMedia;
+        }
+        settings.cloud_transcription = self.cloud_transcription;
+        settings.processing = self.processing;
     }
+}
+
+/// Nix's original Linux seed shape, merged with fresh-install defaults.
+/// Existing shared or legacy settings always win before this is called.
+pub(crate) fn initial_settings(bytes: &[u8]) -> Result<AppSettings> {
+    fn merge(defaults: &mut serde_json::Value, seed: serde_json::Value) {
+        match (defaults, seed) {
+            (serde_json::Value::Object(defaults), serde_json::Value::Object(seed)) => {
+                for (key, value) in seed {
+                    merge(
+                        defaults.entry(key).or_insert(serde_json::Value::Null),
+                        value,
+                    );
+                }
+            }
+            (defaults, seed) => *defaults = seed,
+        }
+    }
+    let seed: serde_json::Value = serde_json::from_slice(bytes)?;
+    if !seed.is_object() {
+        return Err(color_eyre::eyre::eyre!(
+            "Initial Linux settings must be a JSON object"
+        ));
+    }
+    let fresh = LegacySettings {
+        paste_with_shift: false,
+        ..Default::default()
+    };
+    let mut defaults = serde_json::to_value(fresh)?;
+    merge(&mut defaults, seed);
+    let legacy: LegacySettings = serde_json::from_value(defaults)?;
+    legacy.dictation_hotkey.validate()?;
+    if !(0.0..=1.0).contains(&legacy.sound_effect_volume) {
+        return Err(color_eyre::eyre::eyre!(
+            "Sound volume must be between zero and one"
+        ));
+    }
+    crate::transcription_models::validate(&legacy.transcription)?;
+    let mut settings = AppSettings::default();
+    legacy.apply_to(&mut settings);
+    settings.validate_providers()?;
+    Ok(settings)
 }
 
 /// The legacy `linux-settings.json` in `directory`, converted, for a
@@ -85,6 +142,57 @@ mod tests {
             .unwrap()
             .apply_to(&mut settings);
         settings
+    }
+
+    #[test]
+    fn fork_provider_settings_survive_upgrade_and_round_trip() {
+        let settings = migrated(
+            r#"{
+            "release_microphone_while_idle":true,
+            "pause_media_while_recording":true,
+            "cloud_transcription":{"model":"gateway-asr","mode":"realtime","server_vad":true,"connection":{"base_url":"http://127.0.0.1:9000/v1","api_key_env":"HEX_SPEECH_KEY"}},
+            "processing":{"default_mode":{"enabled":true,"backend":"responses","model":"cleanup","thinking":"high","context":{"active_field":true,"screen":"ocr","ocr_languages":"eng+ara"}},"modes":[{"name":"Editor","applications":["code"],"replacements":[{"matched_phrase":"hex app","output":"HEX"}]}]}
+        }"#,
+        );
+        settings.validate_providers().unwrap();
+        let cloud = settings.cloud_transcription.as_ref().unwrap();
+        assert_eq!(cloud.model, "gateway-asr");
+        assert_eq!(cloud.mode, crate::cloud::TranscriptionMode::Realtime);
+        assert!(cloud.server_vad);
+        assert!(settings.release_microphone_while_idle);
+        assert_eq!(
+            settings.recording_audio_behavior,
+            crate::app_settings::RecordingAudioBehavior::PauseMedia
+        );
+        assert_eq!(
+            settings.processing.default_mode.thinking,
+            crate::cloud::Thinking::High
+        );
+        assert_eq!(settings.processing.modes[0].applications, ["code"]);
+        let restored: AppSettings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+    }
+
+    #[test]
+    fn initial_settings_keep_fresh_defaults_and_merge_nested_keys() {
+        let settings = initial_settings(br#"{"dictation_hotkey":{"alt":false,"super_key":true},"pause_media_while_recording":true}"#).unwrap();
+        assert_eq!(settings.dictation_hotkey.keycaps().join("+"), "Super+Space");
+        assert!(!settings.paste_with_shift);
+        assert_eq!(settings.sound_effect_volume, 0.5);
+        assert_eq!(
+            settings.recording_audio_behavior,
+            crate::app_settings::RecordingAudioBehavior::PauseMedia
+        );
+        for invalid in [
+            "null",
+            "[]",
+            "{",
+            r#"{"sound_effect_volume":2}"#,
+            r#"{"processing":{"default_mode":{"deadline_seconds":0}}}"#,
+        ] {
+            assert!(initial_settings(invalid.as_bytes()).is_err(), "{invalid}");
+        }
     }
 
     #[test]

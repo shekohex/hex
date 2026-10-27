@@ -893,7 +893,7 @@ fn generate(prompt: &str, model: Option<&Model>, deadline: Duration) -> Result<S
 }
 
 #[cfg(not(target_os = "windows"))]
-fn generate_cancellable(
+pub(crate) fn generate_cancellable(
     prompt: &str,
     model: Option<&Model>,
     deadline: Duration,
@@ -2623,7 +2623,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn cancelled_generation_process_is_killed_promptly() {
-        let mut command = Command::new("/bin/sleep");
+        let mut command = Command::new("sleep");
         command.arg("5");
         let cancelled = AtomicBool::new(true);
         let started = Instant::now();

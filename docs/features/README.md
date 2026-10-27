@@ -789,6 +789,13 @@ stated limits when using it as evidence.
 points. Preview badges do not prove installed-app login registration or a signed
 update from an older supported build.
 
+## Linux cloud providers
+
+[Cloud dictation and cleanup](cloud.md) maps the fork's provider opt-in,
+realtime/VAD and batch recovery, context, thinking, RAM-only retry, and Nix migration.
+Local transcription remains the default. Cloud opt-in sends intentional audio to
+its selected provider; cleanup context is separately opt-in.
+
 ## Other Platforms And Consumers
 
 ```ts

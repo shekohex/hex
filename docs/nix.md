@@ -142,3 +142,14 @@ marked ignored because they require a desktop or installed model remain
 ignored; the Nix build does not download models or exercise live input.
 
 The initial packaging design builds on [PR #29](https://github.com/anomalyco/hex/pull/29).
+
+## Fork Provider Compatibility
+
+`programs.hex.gnomeIntegration = true` installs/enables `hex@shekohex.dev` for
+GNOME Wayland. Log out/in after updating an already-loaded extension.
+`programs.hex.initialSettings` retains the original Linux seed format, including
+`cloud_transcription`, `processing`, `release_microphone_while_idle`, and
+`pause_media_while_recording`. It only seeds when neither shared `settings.json`
+nor legacy `linux-settings.json` exists; runtime edits always win.
+Cloud/provider settings migrate once into shared `settings.json`, never into the
+Nix store. Put only environment-variable names or private key-file paths in Nix.

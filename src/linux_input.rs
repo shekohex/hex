@@ -291,7 +291,7 @@ impl HotkeyStatus {
             .clone()
     }
 
-    fn set_shortcuts(&self, shortcuts: DesktopShortcuts) {
+    pub(crate) fn set_shortcuts(&self, shortcuts: DesktopShortcuts) {
         *self
             .shortcuts
             .lock()
@@ -301,7 +301,7 @@ impl HotkeyStatus {
 
 /// A shortcut a backend reports pressed or released.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Shortcut {
+pub(crate) enum Shortcut {
     Dictation,
     PasteLast,
     VoiceAction,
@@ -325,7 +325,7 @@ impl Shortcut {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Input {
+pub(crate) enum Input {
     Pressed(Shortcut),
     Released(Shortcut),
     Escape,
@@ -505,7 +505,7 @@ impl From<Receiver<ShortcutCommand>> for CommandQueue {
 /// The monitor thread's side: the state machine and its outputs. Backends
 /// feed inputs, update their Escape registration, then [`Dispatcher::flush`],
 /// so Escape is registered before dictation hears that recording started.
-struct Dispatcher {
+pub(crate) struct Dispatcher {
     state: ShortcutState,
     sender: SyncSender<HotkeyEvent>,
     commands: CommandQueue,
@@ -526,13 +526,19 @@ impl Dispatcher {
         }
     }
 
-    fn input(&mut self, input: Input) {
-        self.pending
-            .extend(self.state.update(input, Instant::now()));
+    pub(crate) fn input(&mut self, input: Input) {
+        let event = self.state.update(input, Instant::now()).or_else(|| {
+            matches!(
+                input,
+                Input::Escape | Input::Command(ShortcutCommand::DictationCancel)
+            )
+            .then_some(HotkeyEvent::Cancel)
+        });
+        self.pending.extend(event);
     }
 
     /// Feeds every queued `hex` command.
-    fn commands(&mut self) {
+    pub(crate) fn commands(&mut self) {
         // Without a sender (`hex dictate`), only shortcuts remain.
         let commands = self
             .commands
@@ -547,7 +553,7 @@ impl Dispatcher {
     }
 
     /// Returns false once dictation stopped listening.
-    fn flush(&mut self) -> Result<bool> {
+    pub(crate) fn flush(&mut self) -> Result<bool> {
         for event in self.pending.drain(..) {
             if !send_event(&self.sender, event)? {
                 return Ok(false);
@@ -663,6 +669,17 @@ impl Backend {
         binding: LinuxHotkey,
         options: HotkeyOptions,
     ) -> Result<()> {
+        if crate::linux_gnome::is_gnome() {
+            return crate::linux_gnome::run(
+                dispatcher,
+                self.stop,
+                self.ready,
+                binding,
+                options,
+                self.started,
+                self.status,
+            );
+        }
         match crate::linux_portal::Portal::connect(&self.stop)? {
             Some(portal) => self.run_portal(portal, dispatcher, binding, options),
             None => {
@@ -1171,7 +1188,7 @@ mod tests {
             }
         }
 
-        fn input(&mut self, input: Input) {
+        pub(crate) fn input(&mut self, input: Input) {
             if let Some(event) = self.state.update(input, self.now) {
                 self.events.push(event);
             }

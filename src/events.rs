@@ -44,6 +44,8 @@ pub enum VoiceEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         processing: Option<DictationProcessing>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timings: Option<Box<DictationTimings>>,
         /// Why a press was discarded as a chord: `key`, `hid-key`, `mouse`, or
         /// `extra-modifier`. Absent for other phases and short taps.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +160,21 @@ pub struct DictationProcessing {
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+}
+
+/// Client-observed durations. Realtime transcription overlaps recording; its
+/// transcription_ms is only the finalization wait after the output worker starts.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DictationTimings {
+    pub audio_ms: u64,
+    pub realtime: bool,
+    pub retries: u8,
+    pub queue_ms: u64,
+    pub transcription_ms: Option<u64>,
+    pub context_wait_ms: Option<u64>,
+    pub cleanup_ms: Option<u64>,
+    pub paste_ms: Option<u64>,
+    pub total_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -332,6 +349,7 @@ impl EventLog {
             text: text.into(),
             processing: None,
             reason: None,
+            timings: None,
         })
     }
 
@@ -343,6 +361,7 @@ impl EventLog {
             text: String::new(),
             processing: None,
             reason: reason.map(Into::into),
+            timings: None,
         })
     }
 
@@ -357,6 +376,24 @@ impl EventLog {
             phase,
             text: text.into(),
             processing,
+            reason: None,
+            timings: None,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    pub fn timed_dictation(
+        &self,
+        phase: DictationPhase,
+        text: impl Into<String>,
+        processing: Option<DictationProcessing>,
+        timings: DictationTimings,
+    ) -> io::Result<()> {
+        self.emit(&VoiceEvent::Dictation {
+            timestamp_ms: now_ms(),
+            phase,
+            text: text.into(),
+            processing,
+            timings: Some(Box::new(timings)),
             reason: None,
         })
     }
@@ -634,6 +671,7 @@ mod tests {
                 fallback: Some("deadline exceeded".into()),
             }),
             reason: None,
+            timings: None,
         };
 
         let decoded: VoiceEvent =
@@ -665,6 +703,7 @@ mod tests {
             phase: DictationPhase::Discarded,
             text: String::new(),
             processing: None,
+            timings: None,
             reason: Some("hid-key".into()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -677,6 +716,7 @@ mod tests {
             text: String::new(),
             processing: None,
             reason: None,
+            timings: None,
         })
         .unwrap();
         assert!(!without.contains("reason"), "{without}");

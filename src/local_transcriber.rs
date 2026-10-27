@@ -311,6 +311,21 @@ impl ModelSwap {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reload(&mut self, selection: &TranscriptionSelection) {
+        if self.loading.is_some() || self.ready.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let load = runnable(selection);
+        let loading = load.clone();
+        std::thread::spawn(move || {
+            let _ =
+                sender.send(LocalTranscriber::load(&load).map_err(|error| format!("{error:#}")));
+        });
+        self.loading = Some((loading, receiver));
+    }
+
     /// Collects a finished load; a failure keeps the current model.
     pub(crate) fn poll(&mut self) -> Option<SwapFailed> {
         let (_, receiver) = self.loading.as_ref()?;

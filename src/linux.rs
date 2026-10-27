@@ -65,6 +65,16 @@ enum Command {
         #[arg(long)]
         device: Option<String>,
     },
+    /// Configure cloud dictation and per-application cleanup providers.
+    Providers {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+    /// Inspect, retry, or clear the last RAM-only recording.
+    Last {
+        #[command(subcommand)]
+        command: LastCommand,
+    },
     /// List microphone devices visible through ALSA.
     Devices,
     /// Query the running Hex, or print observations with --lines.
@@ -88,6 +98,21 @@ enum Command {
         #[command(subcommand)]
         command: crate::experiments::ExperimentsCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    Show,
+    Configure { file: PathBuf },
+}
+#[derive(Subcommand)]
+enum LastCommand {
+    Show,
+    Retry {
+        #[arg(long)]
+        cleanup_only: bool,
+    },
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -174,6 +199,57 @@ pub(crate) fn run(shutdown: &'static AtomicBool) -> Result<()> {
             VoiceActionAction::Stop => ShortcutCommand::VoiceActionStop,
             VoiceActionAction::Toggle => ShortcutCommand::VoiceActionToggle,
         }),
+        Command::Providers { command } => {
+            match command {
+                ProviderCommand::Show => {
+                    let settings = crate::linux_service::request(Request::Status)?.settings;
+                    let configuration = crate::linux_pipeline::ProviderConfiguration {
+                        cloud_transcription: settings.cloud_transcription,
+                        processing: settings.processing,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&configuration)?);
+                }
+                ProviderCommand::Configure { file } => {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(file)?
+                        .take(96 * 1024 + 1)
+                        .read_to_end(&mut bytes)?;
+                    if bytes.len() > 96 * 1024 {
+                        return Err(color_eyre::eyre::eyre!(
+                            "Provider configuration exceeds 96 KiB"
+                        ));
+                    }
+                    let configuration: crate::linux_pipeline::ProviderConfiguration =
+                        serde_json::from_slice(&bytes)?;
+                    configuration.validate()?;
+                    crate::linux_service::request(Request::ConfigureProviders(Box::new(
+                        configuration,
+                    )))?;
+                }
+            }
+            Ok(())
+        }
+        Command::Last { command } => {
+            let snapshot = crate::linux_service::request(Request::Status)?.last_dictation;
+            match command {
+                LastCommand::Show => println!("{}", serde_json::to_string_pretty(&snapshot)?),
+                LastCommand::Retry { cleanup_only } => {
+                    let last =
+                        snapshot.ok_or_else(|| color_eyre::eyre::eyre!("No recording retained"))?;
+                    crate::linux_service::request(Request::RetryLast {
+                        id: last.id,
+                        cleanup_only,
+                    })?;
+                }
+                LastCommand::Clear => {
+                    if let Some(last) = snapshot {
+                        crate::linux_service::request(Request::ClearLast { id: last.id })?;
+                    }
+                }
+            }
+            Ok(())
+        }
         Command::PasteLast => shortcut(ShortcutCommand::PasteLast),
         Command::Dictate { device } => {
             let _instance = crate::instance::acquire("listener")?;
@@ -269,6 +345,8 @@ impl Command {
                 | Self::Dictation { .. }
                 | Self::VoiceAction { .. }
                 | Self::PasteLast
+                | Self::Providers { .. }
+                | Self::Last { .. }
                 | Self::Status { lines: None }
         )
     }
