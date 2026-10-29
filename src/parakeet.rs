@@ -36,8 +36,11 @@ pub struct Parakeet {
     selection: Option<TranscriptionSelection>,
     max_audio_samples: Option<usize>,
     stream: Option<transcribe_cpp::StreamOptions>,
+    _weights: procwatch::Lease,
 }
 
+/// Loaded model weights, estimated from the model file size (they live in Metal buffers).
+static MODEL_WEIGHTS: procwatch::Gauge = procwatch::Gauge::new("speech.model_weights");
 static TRANSCRIBE_LOGGING: Once = Once::new();
 const TRANSCRIPTION_SAMPLES_PER_MS: usize = 16;
 const MAX_PENDING_OUTPUTS: usize = 16;
@@ -173,6 +176,9 @@ struct JobControl {
     output_started: Mutex<bool>,
     /// The control phrase a voice transcript ended with.
     spoken: OnceLock<DictationControl>,
+    /// A programmatic dictation's job: its owner app cancels it through the
+    /// API, so Escape never does.
+    owner_cancels: bool,
 }
 
 impl JobControl {
@@ -185,6 +191,15 @@ impl JobControl {
             return false;
         }
         !self.cancelled.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether [`JobControl::cancel`] would cancel it now.
+    fn cancellable(&self) -> bool {
+        let output_started = self
+            .output_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        !*output_started && !self.is_cancelled()
     }
 
     fn is_cancelled(&self) -> bool {
@@ -256,7 +271,14 @@ impl WorkerState {
         self.jobs
             .iter()
             .rev()
+            .filter(|(_, control)| !control.owner_cancels)
             .find_map(|(&job_id, control)| control.cancel().then_some(job_id))
+    }
+
+    fn has_escape_cancellable_job(&self) -> bool {
+        self.jobs
+            .values()
+            .any(|control| !control.owner_cancels && control.cancellable())
     }
 }
 
@@ -385,7 +407,10 @@ impl DictationWorker {
         let (Some(engine), Some(jobs)) = (&self.engine, &self.inference_jobs) else {
             return Err("dictation worker is unavailable");
         };
-        let control = Arc::new(JobControl::default());
+        let control = Arc::new(JobControl {
+            owner_cancels: matches!(target, TranscriptionTarget::Service),
+            ..JobControl::default()
+        });
         let (_, selection) = crate::app_settings::transcription_selection();
         let submitted_at = Instant::now();
         let audio_ms = clip.duration_ms();
@@ -515,6 +540,15 @@ impl DictationWorker {
             .unwrap_or_else(|error| error.into_inner())
             .jobs
             .len()
+    }
+
+    /// Whether Escape has a queued job to cancel; programmatic dictations'
+    /// jobs don't count.
+    pub fn has_escape_cancellable_job(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .has_escape_cancellable_job()
     }
 
     pub fn cancel_latest(&self) -> Option<DictationJobId> {
@@ -1297,6 +1331,7 @@ impl Parakeet {
             language = runtime_language;
         }
         let session = OfflineGgufSession::new(model)?;
+        let weights_bytes = std::fs::metadata(model_path).map_or(0, |meta| meta.len() as usize);
         Ok(Self {
             session,
             options: RunOptions {
@@ -1316,6 +1351,7 @@ impl Parakeet {
                 capabilities.max_audio_ms,
             ),
             stream: None,
+            _weights: MODEL_WEIGHTS.track(weights_bytes),
         })
     }
 
@@ -1918,6 +1954,12 @@ mod tests {
             Box::new(model),
         )))
         .unwrap();
+        // `HEX_STREAM_LIVE_TEXT=0` replays without reading live text.
+        let engine = if std::env::var("HEX_STREAM_LIVE_TEXT").is_ok_and(|value| value == "0") {
+            engine
+        } else {
+            engine.with_live_text()
+        };
         let speed = std::env::var("HEX_STREAM_SPEED")
             .ok()
             .and_then(|speed| speed.parse::<f64>().ok())
@@ -1975,10 +2017,27 @@ mod tests {
             let mut stream = engine.begin().expect("the model streams");
             let held = samples.len().saturating_sub(3_200);
             let feeding = Instant::now();
+            // Live text as a HUD would read it: (audio fed in ms, stable
+            // words, tentative words), and how often the stable text was
+            // rewritten instead of extended.
+            let mut timeline = Vec::new();
+            let mut stable = String::new();
+            let mut rewrites = 0;
             for (index, block) in samples[..held].chunks(2_560).enumerate() {
                 let due = std::time::Duration::from_secs_f64(index as f64 * 0.16 / speed);
                 thread::sleep(due.saturating_sub(feeding.elapsed()));
                 stream.feed(block);
+                if let Some(partial) = stream.take_partial() {
+                    if !partial.stable.starts_with(stable.as_str()) {
+                        rewrites += 1;
+                    }
+                    stable = partial.stable.clone();
+                    timeline.push((
+                        stream.fed() / 16,
+                        words(&partial.stable).len(),
+                        words(&partial.tentative).len(),
+                    ));
+                }
             }
             thread::sleep(std::time::Duration::from_secs_f64(0.2 / speed));
             let streamed = engine
@@ -2009,6 +2068,19 @@ mod tests {
             );
             println!("  offline {}", whole.text);
             println!("  stream  {}", streamed.text);
+            let first_text_ms = timeline
+                .iter()
+                .find(|(_, stable, tentative)| stable + tentative > 0)
+                .map(|(fed_ms, ..)| *fed_ms);
+            println!(
+                "  live text: updates={} first_text_at_audio_ms={first_text_ms:?} stable_rewrites={rewrites} last_stable_words={}/{}",
+                timeline.len(),
+                timeline.last().map_or(0, |(_, stable, _)| *stable),
+                reference.len()
+            );
+            for (fed_ms, stable, tentative) in &timeline {
+                println!("    audio_ms={fed_ms} stable_words={stable} tentative_words={tentative}");
+            }
             assert_eq!(streamed.source, Source::Stream);
             assert!(differences * 20 <= reference.len().max(20));
         }
@@ -2138,10 +2210,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires VOICE_CONTROL_DICTATION_FIXTURE_DIR and the installed Parakeet model"]
+    fn escape_skips_programmatic_dictation_jobs() {
+        let owned = || {
+            Arc::new(JobControl {
+                owner_cancels: true,
+                ..JobControl::default()
+            })
+        };
+        let state = WorkerState {
+            next_sequence: 2,
+            jobs: BTreeMap::from([
+                (DictationJobId(0), Arc::new(JobControl::default())),
+                (DictationJobId(1), owned()),
+            ]),
+            pending_pastes: 0,
+        };
+        assert!(state.has_escape_cancellable_job());
+        assert_eq!(state.cancel_latest(), Some(DictationJobId(0)));
+        assert_eq!(state.cancel_latest(), None);
+        assert!(!state.has_escape_cancellable_job());
+        assert!(!state.jobs[&DictationJobId(1)].is_cancelled());
+
+        // A job whose output has started can no longer be cancelled.
+        let pasting = WorkerState {
+            next_sequence: 1,
+            jobs: BTreeMap::from([(DictationJobId(0), Arc::new(JobControl::default()))]),
+            pending_pastes: 0,
+        };
+        assert!(pasting.jobs[&DictationJobId(0)].begin_output());
+        assert!(!pasting.has_escape_cancellable_job());
+        assert_eq!(pasting.cancel_latest(), None);
+
+        let only_owned = WorkerState {
+            next_sequence: 1,
+            jobs: BTreeMap::from([(DictationJobId(0), owned())]),
+            pending_pastes: 0,
+        };
+        assert!(!only_owned.has_escape_cancellable_job());
+    }
+
+    #[test]
+    #[ignore = "requires HEX_DICTATION_FIXTURE_DIR and the installed Parakeet model"]
     fn dictation_protocol_audio() {
-        let directory =
-            PathBuf::from(std::env::var("VOICE_CONTROL_DICTATION_FIXTURE_DIR").unwrap());
+        let directory = PathBuf::from(std::env::var("HEX_DICTATION_FIXTURE_DIR").unwrap());
         let protocol = DictationProtocol::try_new(
             vec!["say".into()],
             vec!["say paste".into(), "say stop".into()],
@@ -2183,9 +2294,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires VOICE_CONTROL_STUTTER_FIXTURE and the installed Parakeet model"]
+    #[ignore = "requires HEX_STUTTER_FIXTURE and the installed Parakeet model"]
     fn tdt_decoder_does_not_repeat_single_letter_tokens() {
-        let path = PathBuf::from(std::env::var("VOICE_CONTROL_STUTTER_FIXTURE").unwrap());
+        let path = PathBuf::from(std::env::var("HEX_STUTTER_FIXTURE").unwrap());
         let mut reader = WavReader::open(path).unwrap();
         let sample_rate = reader.spec().sample_rate;
         let samples = reader

@@ -7,9 +7,8 @@
 //! name per line, `#` comments). The process reads them once, on first use,
 //! so changes apply at the next launch. Unknown names are logged and ignored.
 //! Debug builds read the same sources; `DEVELOPER_FEATURES_ENABLED` turns
-//! nothing on. An experiment behind a build option (`capture`) exists only
-//! in builds with that option: others do not list it, cannot enable it, and
-//! treat its name as unknown.
+//! nothing on. An experiment a platform has no code for (`capture` on
+//! Windows) is not listed there, cannot be enabled, and its name is unknown.
 //!
 //! Gate an experiment where it starts (the worker, thread, or capture that
 //! does its work), not only where its UI shows: a hidden pane whose worker
@@ -30,33 +29,41 @@ pub const ENV: &str = "HEX_EXPERIMENTS";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Experiment {
     Capture,
+    DotScope,
     LiveChapters,
+    LiveText,
+    Modes,
+    Playground,
     SmartTurn,
     Vocabulary,
     VoiceFilter,
 }
 
 impl Experiment {
-    /// Every experiment, including those behind a build option;
+    /// Every experiment, including those a platform lacks;
     /// [`Self::available`] lists the ones this build offers.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 9] = [
         Self::Capture,
+        Self::DotScope,
         Self::LiveChapters,
+        Self::LiveText,
+        Self::Modes,
+        Self::Playground,
         Self::SmartTurn,
         Self::Vocabulary,
         Self::VoiceFilter,
     ];
 
-    /// The experiments this build offers: one behind a build option only
-    /// when built with it.
+    /// The experiments this build offers: `capture` only where it has a
+    /// host.
     pub fn available() -> impl Iterator<Item = Self> {
         Self::ALL
             .into_iter()
             .filter(|experiment| experiment.offered())
     }
 
-    /// Whether this build has the experiment's code: `capture` only with
-    /// the `capture` build option on macOS.
+    /// Whether this build has the experiment's code: `capture` on macOS
+    /// and Linux.
     const fn offered(self) -> bool {
         !matches!(self, Self::Capture) || cfg!(hex_capture)
     }
@@ -65,7 +72,11 @@ impl Experiment {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Capture => "capture",
+            Self::DotScope => "dot-scope",
             Self::LiveChapters => "live-chapters",
+            Self::LiveText => "live-text",
+            Self::Modes => "modes",
+            Self::Playground => "playground",
             Self::SmartTurn => "smart-turn",
             Self::Vocabulary => "vocabulary",
             Self::VoiceFilter => "voice-filter",
@@ -74,10 +85,20 @@ impl Experiment {
 
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Capture => {
-                "Scrawl's capture engine (`hex capture`; macOS, the `capture` build option)."
+            Self::Capture => "Scrawl's capture engine (`hex capture`; macOS and Linux).",
+            Self::DotScope => {
+                "Dot scope: the recording indicator as a braided dot oscilloscope (macOS, Linux, Windows; tuned in HUD Lab)."
             }
             Self::LiveChapters => "Chapter a meeting's transcript live while it records.",
+            Self::LiveText => {
+                "Live text: a streaming model publishes what you have said so far while you dictate."
+            }
+            Self::Modes => {
+                "Modes: the pane, per-app corrections, OpenCode rewriting, and transformations."
+            }
+            Self::Playground => {
+                "Rune's playground in the window (⇧⌘D, Ctrl+Shift+D off macOS): every fixture scene and story."
+            }
             Self::SmartTurn => {
                 "Stop hands-free dictation when Smart Turn hears you finish (macOS)."
             }
@@ -540,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_exists_only_with_its_build_option() {
+    fn capture_exists_only_where_it_has_a_host() {
         let built = cfg!(hex_capture);
         let offered = Experiment::available().any(|experiment| experiment == Experiment::Capture);
         assert_eq!(offered, built);
@@ -551,7 +572,7 @@ mod tests {
         assert_eq!(
             snapshot.unknown.is_empty(),
             built,
-            "builds without the option treat `capture` as unknown"
+            "Windows treats `capture` as unknown"
         );
         let listed = list_json(&snapshot, Path::new("/x"))
             .experiments
@@ -669,8 +690,32 @@ mod tests {
                 "file": "/home/kit/.config/hex/experiments",
                 "experiments": [
                     {
+                        "name": "dot-scope",
+                        "description": Experiment::DotScope.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
                         "name": "live-chapters",
                         "description": Experiment::LiveChapters.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
+                        "name": "live-text",
+                        "description": Experiment::LiveText.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
+                        "name": "modes",
+                        "description": Experiment::Modes.description(),
+                        "enabled": false,
+                        "sources": [],
+                    },
+                    {
+                        "name": "playground",
+                        "description": Experiment::Playground.description(),
                         "enabled": false,
                         "sources": [],
                     },

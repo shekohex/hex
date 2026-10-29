@@ -15,6 +15,7 @@ use crate::model::{
 // displays and windows, and the screen recorder. Each platform module provides the same items.
 #[cfg_attr(target_os = "macos", path = "capture/macos.rs")]
 #[cfg_attr(target_os = "windows", path = "capture/windows.rs")]
+#[cfg_attr(target_os = "linux", path = "capture/linux.rs")]
 mod platform;
 pub use platform::*;
 
@@ -23,6 +24,7 @@ pub const FRAME_SAMPLE_INTERVAL: Duration = Duration::from_millis(220);
 /// decoded from `recording.mp4` at full size afterwards.
 pub const CANDIDATE_EDGE: f64 = 480.0;
 /// Without a recording to decode from, the candidates are the keyframes, so keep them sharper.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub(crate) const CANDIDATE_EDGE_NO_VIDEO: f64 = 1280.0;
 /// The candidates' memory ceiling, however long the capture runs.
 pub const CANDIDATE_BUDGET_BYTES: usize = 384 << 20;
@@ -113,10 +115,81 @@ impl CandidateBuffer {
 pub struct ScreenRecording {
     /// Small candidate frames for keyframe selection (see `CANDIDATE_EDGE`).
     pub frames: Vec<RgbaFrame>,
-    pub video: Option<PathBuf>,
+    /// The movie, which may still be finishing: only what reads it waits ([`Movie::wait`]).
+    pub video: Option<Movie>,
     pub duration_ms: u64,
-    /// The capture time (on the frames' clock) of the video's start.
-    pub video_offset_ms: u64,
+}
+
+impl ScreenRecording {
+    /// Blocks until nothing writes the movie any more, so its bundle can be removed.
+    pub fn discard(self) {
+        if let Some(movie) = self.video {
+            let _ = movie.wait();
+        }
+    }
+}
+
+/// A screen capture's movie. On macOS its file is still being finished when the capture stops:
+/// the recording output closes it and its final frame is held to the stop.
+pub struct Movie {
+    path: PathBuf,
+    state: MovieState,
+}
+
+enum MovieState {
+    Written {
+        offset_ms: u64,
+    },
+    #[cfg(target_os = "macos")]
+    Finishing(platform::FinishingMovie),
+}
+
+impl Movie {
+    /// A movie already written, starting `offset_ms` into the capture (on the frames' clock).
+    pub fn written(path: PathBuf, offset_ms: u64) -> Self {
+        Self {
+            path,
+            state: MovieState::Written { offset_ms },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn finishing(path: PathBuf, finishing: platform::FinishingMovie) -> Self {
+        Self {
+            path,
+            state: MovieState::Finishing(finishing),
+        }
+    }
+
+    /// Where the movie is, finished or not.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// When the movie starts on the frames' clock, before it finishes: exact once written, an
+    /// estimate from when its recording started while it finishes.
+    pub fn offset_hint_ms(&self) -> u64 {
+        match &self.state {
+            MovieState::Written { offset_ms } => *offset_ms,
+            #[cfg(target_os = "macos")]
+            MovieState::Finishing(finishing) => finishing.offset_hint_ms(),
+        }
+    }
+
+    /// Blocks until the movie is finished. Returns its path and when it starts on the frames'
+    /// clock, or `None` when nothing playable was left.
+    pub fn wait(self) -> Option<(PathBuf, u64)> {
+        let offset_ms = match self.state {
+            MovieState::Written { offset_ms } => Some(offset_ms),
+            #[cfg(target_os = "macos")]
+            MovieState::Finishing(finishing) => finishing.wait(),
+        }?;
+        let written = self
+            .path
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() > 0);
+        written.then_some((self.path, offset_ms))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +254,10 @@ pub struct OwnWindows {
     /// Click-through window IDs (such as the ink overlay) ignored when checking whether a click
     /// landed on the host's own UI.
     pub passthrough: Vec<u32>,
+    /// Set, the recording shows the host's own windows: neither `excluded` nor the host's
+    /// other non-layer-0 windows are left out. Read while recording, so the host can flip it
+    /// mid-capture (a demo that shows the host's overlays).
+    pub recorded: Arc<AtomicBool>,
 }
 
 /// What the host provides. Every method has a default except `emit`; `emit` and `log` must return
@@ -657,6 +734,7 @@ pub fn hotkey_combos(kind: ShortcutKind, cfg: &ShortcutConfig) -> Vec<(u32, u32)
     combos
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn clean_label(input: &str) -> String {
     let squashed = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = squashed.trim();
@@ -752,18 +830,25 @@ pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
 }
 
 /// What the platform's sampler thread records into. It runs until `stopping`, pushes candidate
-/// frames (at once when `urgent`), stores when the movie started into `video_offset_ms`, and
-/// returns the movie it wrote.
+/// frames (at once when `urgent`), and returns the movie it recorded.
 pub(crate) struct Sampler {
     pub target: TargetInfo,
     pub video_output_path: Option<PathBuf>,
     /// Scrawl's own windows to leave out of the recording.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     pub excluded_window_ids: Arc<Mutex<Vec<u32>>>,
+    /// [`OwnWindows::recorded`]: while set, nothing of the host's is left out.
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
+    pub own_windows_recorded: Arc<AtomicBool>,
     pub started_at: Instant,
+    /// `started_at` on the host clock, which places the movie's start on the frames' clock.
+    #[cfg(target_os = "macos")]
+    pub started_host: capture_core::HostTime,
     pub stopping: Arc<AtomicBool>,
     pub urgent: Arc<AtomicBool>,
     pub frames: Arc<Mutex<CandidateBuffer>>,
+    /// Where the Windows recorder stores when its movie started (ms since `started_at`).
+    #[cfg(target_os = "windows")]
     pub video_offset_ms: Arc<AtomicU64>,
 }
 
@@ -774,8 +859,7 @@ pub struct ScreenCaptureSession {
     stopping: Arc<AtomicBool>,
     urgent_snapshot: Arc<AtomicBool>,
     frames: Arc<Mutex<CandidateBuffer>>,
-    video_offset_ms: Arc<AtomicU64>,
-    sampler_thread: Option<JoinHandle<Option<PathBuf>>>,
+    sampler_thread: Option<JoinHandle<Option<Movie>>>,
     _recording: crate::retention::Recording,
 }
 
@@ -789,6 +873,7 @@ impl ScreenCaptureSession {
             target,
             video_output_path,
             excluded_window_ids,
+            Arc::default(),
             CANDIDATE_BUDGET_BYTES,
         )
     }
@@ -797,18 +882,19 @@ impl ScreenCaptureSession {
         target: TargetInfo,
         video_output_path: Option<PathBuf>,
         excluded_window_ids: Arc<Mutex<Vec<u32>>>,
+        own_windows_recorded: Arc<AtomicBool>,
         budget_bytes: usize,
     ) -> Self {
         let started_at = Instant::now();
+        #[cfg(target_os = "macos")]
+        let started_host = capture_core::HostTime::now();
         let stopping = Arc::new(AtomicBool::new(false));
         let urgent_snapshot = Arc::new(AtomicBool::new(true));
         let frames = Arc::new(Mutex::new(CandidateBuffer::new(budget_bytes)));
-        let video_offset_ms = Arc::new(AtomicU64::new(0));
 
         let thread_stopping = Arc::clone(&stopping);
         let thread_urgent = Arc::clone(&urgent_snapshot);
         let thread_frames = Arc::clone(&frames);
-        let thread_offset = Arc::clone(&video_offset_ms);
         let sampler_target = target;
         let sampler_thread = thread::Builder::new()
             .name("scrawl-frame-sampler".into())
@@ -817,11 +903,15 @@ impl ScreenCaptureSession {
                     target: sampler_target,
                     video_output_path,
                     excluded_window_ids,
+                    own_windows_recorded,
                     started_at,
+                    #[cfg(target_os = "macos")]
+                    started_host,
                     stopping: thread_stopping,
                     urgent: thread_urgent,
                     frames: thread_frames,
-                    video_offset_ms: thread_offset,
+                    #[cfg(target_os = "windows")]
+                    video_offset_ms: Arc::new(AtomicU64::new(0)),
                 })
             })
             .ok();
@@ -831,7 +921,6 @@ impl ScreenCaptureSession {
             stopping,
             urgent_snapshot,
             frames,
-            video_offset_ms,
             sampler_thread,
             _recording: crate::retention::Recording::start(),
         }
@@ -848,10 +937,11 @@ impl ScreenCaptureSession {
         self.started_at.elapsed().as_millis() as u64
     }
 
+    /// Stops at once: the movie keeps finishing on its own (see [`Movie`]).
     pub fn stop(mut self) -> ScreenRecording {
         let duration_ms = self.elapsed_ms();
         self.stopping.store(true, Ordering::Release);
-        let video_path = self
+        let video = self
             .sampler_thread
             .take()
             .and_then(|handle| {
@@ -870,13 +960,10 @@ impl ScreenCaptureSession {
         if collected.is_empty() {
             collected.push(crate::render::render_synthetic_demo_frame(1280, 800, 0, 0));
         }
-        let valid_video =
-            video_path.filter(|path| path.exists() && path.metadata().is_ok_and(|m| m.len() > 0));
         ScreenRecording {
             frames: collected,
-            video: valid_video,
+            video,
             duration_ms: duration_ms.max(100),
-            video_offset_ms: self.video_offset_ms.load(Ordering::Acquire),
         }
     }
 }
@@ -1137,16 +1224,16 @@ pub struct SharedCaptureTelemetry {
     /// The last `on_scrawl_window` answer (when, where, what), reused for a burst of scrolls.
     scrawl_hit: Mutex<Option<(Instant, f64, f64, bool)>>,
     /// macOS's key event tap (`CFMachPortRef`), made once Accessibility is on (`check_key_tap`).
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     tap_port: AtomicU64,
     /// The key event tap thread's run loop (retained), so `check_key_tap` can stop it.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     tap_run_loop: AtomicU64,
     /// A key tap thread is being started.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     tap_starting: AtomicBool,
     /// When the last key tap was tried (ms since `UNIX_EPOCH`), to space out retries.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     tap_tried_ms: AtomicU64,
     /// Whether key presses are arriving (macOS's key tap, Windows' keyboard hook).
     tap_live: AtomicBool,
@@ -1600,7 +1687,7 @@ impl SharedCaptureTelemetry {
     }
 
     /// The helper process whose window is the capture target (the iPhone mirror).
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     pub fn set_capture_source_pid(&self, pid: u32) {
         self.capture_source_pid
             .store(i32::try_from(pid).unwrap_or(0), Ordering::Release);
@@ -1941,6 +2028,7 @@ impl SharedCaptureTelemetry {
 /// Clicks from the mouse buttons' polled state, while the mouse monitor (or hook) is missing: a
 /// press starts a click (unless it lands on Scrawl's own window), a release ends it. A ⇧-press may
 /// be a pin, as in the mouse monitor's handler.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn poll_clicks(
     telemetry: &SharedCaptureTelemetry,
     prev: &mut [bool; 2],
@@ -2051,6 +2139,7 @@ fn same_target_frame(a: TargetFrame, b: TargetFrame) -> bool {
 /// One poll of the Shift ink: holding Shift alone and moving the cursor inside the capture
 /// target draws a persistent stroke; letting go of Shift commits it. `pure_shift` is Shift
 /// without other modifiers (and not left over from a chord such as the capture shortcut).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn track_shift_ink(
     telemetry: &SharedCaptureTelemetry,
     (x, y): (f64, f64),
@@ -2617,6 +2706,7 @@ impl Engine {
                     target.clone(),
                     Some(video_path),
                     Arc::clone(&telemetry.excluded_window_ids),
+                    Arc::clone(&own.recorded),
                     engine_cfg.candidate_budget_bytes(),
                 );
                 self.host
@@ -2852,13 +2942,14 @@ impl Capture {
                 audio,
                 windows,
             } => {
-                let _ = session.stop();
+                let recording = session.stop();
                 if let Some(audio) = audio {
                     let _ = audio.stop();
                 }
                 if let Some(windows) = windows {
                     let _ = windows.stop();
                 }
+                recording.discard();
             }
             InnerSource::Phone(session) => session.cancel(),
         }
@@ -2960,6 +3051,9 @@ impl SealedCapture {
     }
 
     pub fn cancel(self) {
+        if let SealedSource::Screen { recording, .. } = self.source {
+            recording.discard();
+        }
         if let Err(error) = std::fs::remove_dir_all(&self.dir) {
             self.host
                 .log(&format!("could not remove {}: {error}", self.dir.display()));
@@ -3126,14 +3220,13 @@ mod tests {
                 .unwrap()
                 .push(RgbaFrame::new(42, 1, 1, vec![1, 2, 3, 255]), false);
             std::fs::write(&worker_path, b"finalized media").unwrap();
-            Some(worker_path)
+            Some(Movie::written(worker_path, 120))
         });
         let session = ScreenCaptureSession {
             started_at: Instant::now(),
             stopping,
             urgent_snapshot: Arc::new(AtomicBool::new(false)),
             frames,
-            video_offset_ms: Arc::new(AtomicU64::new(120)),
             sampler_thread: Some(worker),
             _recording: crate::retention::Recording::start(),
         };
@@ -3142,8 +3235,10 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].t_ms, 42);
         assert_eq!(frames[0].rgba, vec![1, 2, 3, 255]);
-        assert_eq!(recording.video.as_ref(), Some(&path));
-        assert_eq!(recording.video_offset_ms, 120);
+        assert_eq!(
+            recording.video.and_then(Movie::wait),
+            Some((path.clone(), 120))
+        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3692,7 +3787,6 @@ mod tests {
             stopping: Arc::new(AtomicBool::new(false)),
             urgent_snapshot: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(Mutex::new(buf)),
-            video_offset_ms: Arc::new(AtomicU64::new(0)),
             sampler_thread: None,
             _recording: crate::retention::Recording::start(),
         };
@@ -3816,7 +3910,6 @@ mod tests {
                     stopping: Arc::clone(&stopping1),
                     urgent_snapshot: Arc::new(AtomicBool::new(false)),
                     frames: Arc::new(Mutex::new(buf1)),
-                    video_offset_ms: Arc::new(AtomicU64::new(0)),
                     sampler_thread: None,
                     _recording: crate::retention::Recording::start(),
                 },
@@ -3855,7 +3948,6 @@ mod tests {
                     stopping: Arc::new(AtomicBool::new(false)),
                     urgent_snapshot: Arc::new(AtomicBool::new(false)),
                     frames: Arc::new(Mutex::new(CandidateBuffer::new(1 << 20))),
-                    video_offset_ms: Arc::new(AtomicU64::new(0)),
                     sampler_thread: None,
                     _recording: crate::retention::Recording::start(),
                 },

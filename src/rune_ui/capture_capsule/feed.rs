@@ -10,6 +10,7 @@ use scrawl_capture::capture::Stage;
 use super::CaptureCapsule;
 use super::flow::{Action, Delivered, Dest, Failure, Input, Mode, Route, Undone};
 use super::ink::InkOverlay;
+use super::picker::PickerOverlay;
 use crate::capture_host::{
     CaptureCommand, CaptureRoute, CaptureSnapshot, CaptureTarget, RouteAnswer, RouteDelivery,
     RouteDest, TargetKind,
@@ -275,6 +276,50 @@ fn capsule_route(answer: &RouteAnswer) -> Option<Route> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// The capsule, its picker, and the ink, installed together.
+pub(crate) struct CaptureOverlays {
+    capsule: CaptureCapsule,
+    picker: PickerOverlay,
+    ink: InkOverlay,
+    /// Whether screen recordings may see them.
+    shown: bool,
+}
+
+impl CaptureOverlays {
+    /// Adds the three overlays, prewarmed and hidden, and starts following
+    /// captures.
+    pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> Self {
+        let picker = PickerOverlay::install(app, act);
+        let aim = picker.clone();
+        let capsule = CaptureCapsule::install(app, move |action| act(aim.resolve(action)));
+        capsule.attach(picker.clone());
+        let ink = InkOverlay::install(app);
+        follow(capsule.clone(), ink.clone());
+        Self {
+            capsule,
+            picker,
+            ink,
+            shown: crate::capture_host::own_windows_recorded(),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Follows `capture.show_overlays_in_recordings` on windows already
+    /// made; returns the new value when it changed.
+    pub(crate) fn follow_recordings(&mut self) -> Option<bool> {
+        let shown = crate::capture_host::own_windows_recorded();
+        if shown == self.shown {
+            return None;
+        }
+        self.shown = shown;
+        self.capsule.show_in_recordings(shown);
+        self.picker.show_in_recordings(shown);
+        self.ink.show_in_recordings(shown);
+        Some(shown)
+    }
+}
+
 /// Moves `capsule` with every published capture change, and wakes `ink` to
 /// look for a recording capture's strokes, on its own thread for the life
 /// of the process.
@@ -284,15 +329,26 @@ pub(crate) fn follow(capsule: CaptureCapsule, ink: InkOverlay) {
         .spawn(move || {
             let watch = crate::capture_host::watch();
             let mut follow = Follow::default();
+            let images = rune::ImageCache::new(std::sync::Arc::new(|| {}));
             loop {
                 let Some(snapshot) = watch.wait(Duration::from_secs(3600)) else {
                     continue;
                 };
                 ink.wake();
-                for input in follow.next(&snapshot) {
+                let inputs = follow.next(&snapshot);
+                // The first frame goes ahead of "Copied", so the capsule
+                // lands with it rather than swapping its check a moment on.
+                if inputs.contains(&Input::Stage(Stage::Done))
+                    && let Some((bundle, _)) = &follow.shown
+                    && let Some(image) = first_frame(&images, bundle)
+                {
+                    capsule.thumbnail(image);
+                }
+                for input in inputs {
                     capsule.input(match input {
                         // The common first-capture failure: the engine's
                         // own reason for it is a ScreenCaptureKit error.
+                        #[cfg(target_os = "macos")]
                         Input::Failed(what @ (Failure::Start | Failure::Save), _)
                             if !crate::meeting::screen_recording_permitted() =>
                         {
@@ -308,16 +364,32 @@ pub(crate) fn follow(capsule: CaptureCapsule, ink: InkOverlay) {
     }
 }
 
+/// A written capture's first keyframe (or its contact sheet), decoded on
+/// the image cache's worker while this thread waits; `None` when neither
+/// reads or decodes.
+fn first_frame(images: &rune::ImageCache, bundle: &std::path::Path) -> Option<rune::Image> {
+    ["frames/frame-01.png", "contact-sheet.png"]
+        .into_iter()
+        .find_map(|name| {
+            let bytes = std::fs::read(bundle.join(name)).ok()?;
+            let image = images.load(bytes);
+            image.wait().ok()?;
+            Some(image)
+        })
+}
+
 /// Carries out a press or key on the capsule: Finish and Cancel end the
 /// capture as `hex capture stop|cancel` would, a chip discards the
 /// recording, the picker starts what it picked, and Record (or the
 /// shortcut) without a pick records the display under the pointer. Runs on the
 /// main thread, so it only queues the commands.
 pub(crate) fn act(action: Action) {
+    use crate::capture_host::CaptureControl;
     use crate::control::ScrawlCaptureAction;
-    use crate::recognition::RecognitionControl;
+    let scrawl = CaptureControl::Scrawl;
+    let command = CaptureControl::Command;
     let screen = || CaptureCommand::Start(CaptureTarget::Display { at: pointer() });
-    let controls: Vec<RecognitionControl> = match action {
+    let controls: Vec<CaptureControl> = match action {
         Action::Finish => vec![scrawl(ScrawlCaptureAction::Stop)],
         Action::Cancel => vec![scrawl(ScrawlCaptureAction::Cancel)],
         // The picker opens: look for a phone cabled since the recording
@@ -329,6 +401,12 @@ pub(crate) fn act(action: Action) {
         Action::Start(target) => vec![command(CaptureCommand::Start(target))],
         // What the picker would record, when it has nothing to record yet
         // (its windows still load): the pointer's display.
+        // Wayland lists no windows: the portal's own picker chooses one.
+        Action::Record(Mode::Window) if cfg!(target_os = "linux") => {
+            vec![command(CaptureCommand::Start(CaptureTarget::Window {
+                id: 0,
+            }))]
+        }
         Action::Record(Mode::Screen | Mode::Window | Mode::Area) => vec![command(screen())],
         Action::Record(Mode::Iphone) => vec![command(CaptureCommand::Start(CaptureTarget::Phone))],
         Action::Switch(Mode::Iphone) => {
@@ -344,30 +422,26 @@ pub(crate) fn act(action: Action) {
         Action::Paste => vec![command(CaptureCommand::Paste)],
         Action::Inspect => vec![command(CaptureCommand::Inspect)],
     };
-    let Some(runtime) = crate::macos_rune::runtime() else {
-        return;
-    };
     for control in controls {
-        if let Err(error) = runtime.recognition(control) {
+        if let Err(error) = crate::capture_host::send_to_listener(control) {
             tracing::warn!(%error, "the capture capsule could not reach the listener");
         }
     }
 }
 
-fn scrawl(action: crate::control::ScrawlCaptureAction) -> crate::recognition::RecognitionControl {
-    let (reply, _) = std::sync::mpsc::sync_channel(1);
-    crate::recognition::RecognitionControl::ScrawlCapture { action, reply }
-}
-
-fn command(command: CaptureCommand) -> crate::recognition::RecognitionControl {
-    let (reply, _) = std::sync::mpsc::sync_channel(1);
-    crate::recognition::RecognitionControl::CaptureCommand { command, reply }
-}
-
 /// Why a capture failed when Screen Recording isn't granted.
+#[cfg(target_os = "macos")]
 const SCREEN_RECORDING_OFF: &str = "Screen Recording is off";
 
+/// The pointer, in global top-left points. Wayland tells Hex nothing of it:
+/// the portal picks the screen.
+#[cfg(not(target_os = "macos"))]
+fn pointer() -> [f64; 2] {
+    [0.0, 0.0]
+}
+
 /// The pointer, in global top-left points.
+#[cfg(target_os = "macos")]
 fn pointer() -> [f64; 2] {
     use core_graphics_types::geometry::CGPoint;
     use std::ffi::c_void;
@@ -702,20 +776,20 @@ mod tests {
         let mut follow = Follow::default();
         follow.next(&recording("a"));
         let guess = || RouteAnswer::Guess {
-            suggested: vec![dest("HEX", "guess")],
+            suggested: vec![dest("HEX", "same page")],
             recent: Vec::new(),
             site: None,
         };
         follow.next(&routed("a", guess(), None));
         let queued = Some(RouteDelivery::Queued {
             to: "HEX".into(),
-            why: "OpenCode can't see this Mac's files".into(),
+            why: "OpenCode can't see files".into(),
         });
         assert_eq!(
             follow.next(&routed("a", guess(), queued)),
             [Input::Delivered(Delivered::Queued {
                 to: "HEX".into(),
-                why: "OpenCode can't see this Mac's files".into(),
+                why: "OpenCode can't see files".into(),
             })]
         );
         let sent = Some(RouteDelivery::Sent { to: "HEX".into() });

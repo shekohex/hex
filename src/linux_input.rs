@@ -14,12 +14,135 @@ use x11rb::connection::Connection;
 use x11rb::errors::ReplyError;
 use x11rb::protocol::ErrorKind;
 use x11rb::protocol::Event;
-use x11rb::protocol::xproto::{ConnectionExt, GrabMode, ModMask, Window};
+use x11rb::protocol::xproto::{ButtonIndex, ConnectionExt, EventMask, GrabMode, ModMask, Window};
 use x11rb::rust_connection::RustConnection;
 
 use crate::app_settings::{HotkeyBinding, HotkeyKey, HotkeyModifiers, ModifierSide};
 use crate::desktop_host::{DesktopGrantedShortcut, DesktopShortcut, DesktopShortcuts};
 use crate::linux_session::LinuxSession;
+
+/// Temporary pointer grab while Settings records a shortcut. Keyboard input
+/// stays with Rune; Escape, focus loss, saving and closing all drop the grab.
+pub(crate) struct MouseCapture {
+    connection: RustConnection,
+    window: Window,
+    grabbed: bool,
+    modifiers: [u16; 4],
+}
+
+impl MouseCapture {
+    pub(crate) fn start() -> Result<Self> {
+        let (connection, root, keymap) = connect_x11()?;
+        let window = connection.get_input_focus()?.reply()?.focus;
+        let pid_atom = connection.intern_atom(false, b"_NET_WM_PID")?.reply()?.atom;
+        let mut ancestor = window;
+        loop {
+            if ancestor == root || ancestor <= 1 {
+                return Err(eyre!("Hex must be focused to record a mouse shortcut"));
+            }
+            let property = connection
+                .get_property(
+                    false,
+                    ancestor,
+                    pid_atom,
+                    x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                    0,
+                    1,
+                )?
+                .reply()?;
+            if let Some(pid) = property.value32().and_then(|mut values| values.next()) {
+                if pid != std::process::id() {
+                    return Err(eyre!("Hex must be focused to record a mouse shortcut"));
+                }
+                break;
+            }
+            ancestor = connection.query_tree(ancestor)?.reply()?.parent;
+        }
+        let mut modifiers = [0; 4];
+        for (slot, symbols) in modifiers.iter_mut().zip([
+            &[XK_CONTROL_L, XK_CONTROL_R][..],
+            &[XK_ALT_L, XK_ALT_R][..],
+            &[XK_SHIFT_L, XK_SHIFT_R][..],
+            &[XK_SUPER_L, XK_SUPER_R][..],
+        ]) {
+            *slot = u16::from(keymap.modifier_for(&connection, symbols)?);
+        }
+        Ok(Self {
+            connection,
+            window,
+            grabbed: false,
+            modifiers,
+        })
+    }
+
+    pub(crate) fn poll(&mut self) -> Result<Option<LinuxHotkey>> {
+        if self.connection.get_input_focus()?.reply()?.focus != self.window {
+            return Err(eyre!("Shortcut recording lost focus"));
+        }
+        if !self.grabbed {
+            // Wait for the click that opened Record to be released.
+            if u16::from(self.connection.query_pointer(self.window)?.reply()?.mask) & 0x1f00 != 0 {
+                return Ok(None);
+            }
+            let status = self
+                .connection
+                .grab_pointer(
+                    false,
+                    self.window,
+                    EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                    x11rb::NONE,
+                    x11rb::NONE,
+                    x11rb::CURRENT_TIME,
+                )?
+                .reply()?
+                .status;
+            if status == x11rb::protocol::xproto::GrabStatus::ALREADY_GRABBED {
+                return Ok(None);
+            }
+            if status != x11rb::protocol::xproto::GrabStatus::SUCCESS {
+                return Err(eyre!("Could not record mouse input: {status:?}"));
+            }
+            self.grabbed = true;
+        }
+        while let Some(event) = self.connection.poll_for_event()? {
+            if let Event::ButtonPress(event) = event {
+                let size = self.connection.get_geometry(self.window)?.reply()?;
+                if !event.same_screen
+                    || event.event_x < 0
+                    || event.event_y < 0
+                    || event.event_x as u16 >= size.width
+                    || event.event_y as u16 >= size.height
+                {
+                    return Err(eyre!("Shortcut recording clicked outside Hex"));
+                }
+                let Some(key) = mouse_name(event.detail) else {
+                    continue;
+                }; // wheel scrolling is not a button binding
+                let state = u16::from(event.state);
+                let [control, alt, shift, super_key] = self.modifiers.map(|mask| state & mask != 0);
+                return Ok(Some(LinuxHotkey {
+                    control,
+                    alt,
+                    shift,
+                    super_key,
+                    key,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        if self.grabbed {
+            let _ = self.connection.ungrab_pointer(x11rb::CURRENT_TIME);
+            let _ = self.connection.flush();
+        }
+    }
+}
 
 /// A shortcut as X11 grabs and the portal see it: held modifiers and a
 /// named key. Settings store it as a portable `HotkeyBinding`.
@@ -99,6 +222,28 @@ impl TryFrom<DesktopShortcut> for LinuxHotkey {
     }
 }
 
+/// Logical numbering is consistent with macOS/Windows; X11 reserves 4–7
+/// for scroll wheels and puts auxiliary buttons at 8 and above.
+pub(crate) fn mouse_button(name: &str) -> Option<u8> {
+    Some(match HotkeyKey::mouse_number(name)? {
+        1 => 1,
+        2 => 3,
+        3 => 2,
+        number => (number + 4) as u8,
+    })
+}
+
+pub(crate) fn mouse_name(button: u8) -> Option<String> {
+    let number = match button {
+        1 => 1,
+        2 => 3,
+        3 => 2,
+        8..=36 => u16::from(button) - 4,
+        _ => return None,
+    };
+    Some(format!("mouse{number}"))
+}
+
 impl LinuxHotkey {
     pub(crate) fn validate(&self) -> Result<()> {
         if self.key.trim().is_empty() {
@@ -114,6 +259,11 @@ impl LinuxHotkey {
     /// The trigger the shortcuts portal asks the desktop for, in the
     /// XDG shortcuts format: `CTRL+ALT+space`.
     pub(crate) fn portal_trigger(&self) -> Result<String> {
+        if mouse_button(&self.key).is_some() {
+            return Err(eyre!(
+                "Wayland's shortcuts portal cannot request mouse buttons; bind the hex commands in the desktop settings"
+            ));
+        }
         self.portal_trigger_for(&keysym_name(&self.key)?)
     }
 
@@ -202,6 +352,9 @@ pub(crate) const KEY_PRESS: u8 = 2;
 pub(crate) const KEY_RELEASE: u8 = 3;
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
 pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(300);
+/// Desktops that repeat a held shortcut's press (KWin) repeat it sooner
+/// than this, so a press after a longer gap is a new press.
+const KEY_REPEAT_GAP: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Binding through the portal can wait for the user to approve a dialog.
 const PORTAL_READY_TIMEOUT: Duration = Duration::from_secs(65);
@@ -224,6 +377,9 @@ pub(crate) enum HotkeyEvent {
     VoiceStart,
     /// The Voice Action shortcut came up: run the instruction.
     VoiceFinish,
+    /// The capture shortcut went down (the `capture` experiment): the
+    /// capture host decides whether it starts or finishes a capture.
+    Capture,
 }
 
 /// What a `hex` command asks of the running listener. Each one is
@@ -260,6 +416,8 @@ pub(crate) struct HotkeyOptions {
     pub(crate) paste_last: Option<LinuxHotkey>,
     /// Held to record a Voice Action instruction.
     pub(crate) voice_action: Option<LinuxHotkey>,
+    /// Starts or finishes a capture, while captures are on.
+    pub(crate) capture: Option<LinuxHotkey>,
 }
 
 pub(crate) const ESCAPE_CANCEL_WARNING: &str =
@@ -271,6 +429,11 @@ pub(crate) struct HotkeyStatus {
     escape_unavailable: Arc<AtomicBool>,
     output_pending: Arc<AtomicBool>,
     shortcuts: Arc<Mutex<DesktopShortcuts>>,
+    /// Whether the shortcuts portal can show the desktop's dialog for them.
+    configurable: Arc<AtomicBool>,
+    /// Settings asked for that dialog.
+    configure: Arc<AtomicBool>,
+    keys: ShortcutKeys,
 }
 
 impl HotkeyStatus {
@@ -300,11 +463,118 @@ impl HotkeyStatus {
             .clone()
     }
 
+    /// When the shortcut that asked for a paste has let go of its keys.
+    pub(crate) fn keys(&self) -> ShortcutKeys {
+        self.keys.clone()
+    }
+
+    pub(crate) fn configurable(&self) -> bool {
+        self.configurable.load(Ordering::Acquire)
+    }
+
+    /// Opens the desktop's dialog for Hex's shortcuts, when it has one.
+    pub(crate) fn configure(&self) {
+        self.configure.store(true, Ordering::Release);
+    }
+
     pub(crate) fn set_shortcuts(&self, shortcuts: DesktopShortcuts) {
         *self
             .shortcuts
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = shortcuts;
+    }
+}
+
+/// How long after a Wayland shortcut's last event its modifiers may still be
+/// down. Hex cannot see them there, so this is the bounded estimate.
+const MODIFIER_GRACE: Duration = Duration::from_millis(250);
+/// The longest a press without its release holds a paste back, for desktops
+/// that drop the release.
+const HELD_LIMIT: Duration = Duration::from_secs(2);
+
+/// When the keys of a Hex shortcut may still be down. Some Wayland
+/// compositors (Hyprland) add every held physical modifier to virtual
+/// keyboard input, turning a paste's Ctrl+V into Ctrl+Alt+V. Hex reads no
+/// input devices, so the paste waits on the shortcut's own events: until a
+/// modifier shortcut's release (portal Deactivated) plus [`MODIFIER_GRACE`],
+/// and [`MODIFIER_GRACE`] after a `hex` command, whose keybinding is unknown.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ShortcutKeys(Arc<Mutex<HeldKeys>>);
+
+#[derive(Debug, Default)]
+struct HeldKeys {
+    /// Modifier shortcuts pressed without their release, by [`Shortcut::index`].
+    held: u8,
+    last: Option<Instant>,
+}
+
+impl HeldKeys {
+    /// When a paste may send its shortcut, or `None` for now.
+    fn quiet_at(&self) -> Option<Instant> {
+        let last = self.last?;
+        Some(
+            last + if self.held != 0 {
+                HELD_LIMIT
+            } else {
+                MODIFIER_GRACE
+            },
+        )
+    }
+}
+
+impl ShortcutKeys {
+    fn update(&self, change: impl FnOnce(&mut HeldKeys)) {
+        let mut keys = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        change(&mut keys);
+        keys.last = Some(Instant::now());
+    }
+
+    fn pressed(&self, shortcut: Shortcut) {
+        self.update(|keys| keys.held |= 1 << shortcut.index());
+    }
+
+    fn released(&self, shortcut: Shortcut) {
+        self.update(|keys| keys.held &= !(1 << shortcut.index()));
+    }
+
+    fn command(&self) {
+        self.update(|_| {});
+    }
+
+    fn released_all(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .held = 0;
+    }
+
+    /// Waits until the shortcut that asked for a paste has plausibly let
+    /// go of its modifiers, or a release ends the wait early.
+    pub(crate) fn settle(&self, stop: &AtomicBool) -> Result<()> {
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Err(eyre!("paste cancelled while stopping the listener"));
+            }
+            let quiet_at = self
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .quiet_at();
+            let Some(wait) = quiet_at.and_then(|at| at.checked_duration_since(Instant::now()))
+            else {
+                return Ok(());
+            };
+            thread::sleep(wait.min(Duration::from_millis(20)));
+        }
+    }
+}
+
+/// Whether a portal trigger holds modifiers: the one the desktop granted,
+/// else the one Hex asked for.
+fn trigger_has_modifiers(granted: Option<&str>, requested: &LinuxHotkey) -> bool {
+    match granted.map(str::trim).filter(|trigger| !trigger.is_empty()) {
+        Some(trigger) => crate::linux_portal::readable_trigger(trigger).contains('+'),
+        None => requested.control || requested.alt || requested.shift || requested.super_key,
     }
 }
 
@@ -314,10 +584,16 @@ pub(crate) enum Shortcut {
     Dictation,
     PasteLast,
     VoiceAction,
+    Capture,
 }
 
 impl Shortcut {
-    const ALL: [Self; 3] = [Self::Dictation, Self::PasteLast, Self::VoiceAction];
+    const ALL: [Self; 4] = [
+        Self::Dictation,
+        Self::PasteLast,
+        Self::VoiceAction,
+        Self::Capture,
+    ];
 
     fn index(self) -> usize {
         self as usize
@@ -329,6 +605,7 @@ impl Shortcut {
             Self::Dictation => ("dictation", "Dictation"),
             Self::PasteLast => ("paste-last", "Paste last dictation"),
             Self::VoiceAction => ("voice-action", "Voice Action"),
+            Self::Capture => ("capture", "Capture"),
         }
     }
 }
@@ -366,6 +643,7 @@ struct ShortcutState {
     /// A Voice Action instruction is recording.
     voice_held: bool,
     last_release: Option<Instant>,
+    last_press: Option<Instant>,
 }
 
 impl ShortcutState {
@@ -378,6 +656,7 @@ impl ShortcutState {
             capture: Capture::Idle,
             voice_held: false,
             last_release: None,
+            last_press: None,
         }
     }
 
@@ -436,28 +715,42 @@ impl ShortcutState {
     fn update(&mut self, input: Input, now: Instant) -> Option<HotkeyEvent> {
         match input {
             Input::Escape | Input::Lost => self.cancel(),
-            Input::Pressed(Shortcut::Dictation) => match self.capture {
-                _ if self.voice_held => None,
-                Capture::Locked => {
-                    self.capture = Capture::Idle;
-                    self.last_release = None;
-                    Some(HotkeyEvent::Finish)
-                }
-                Capture::Idle => {
-                    let second_tap = self.toggle
-                        || self.last_release.take().is_some_and(|released| {
-                            now.checked_duration_since(released)
-                                .is_some_and(|gap| gap < DOUBLE_TAP_WINDOW)
-                        });
-                    if self.double_tap_only && !second_tap {
-                        self.capture = Capture::Armed;
-                        return None;
+            Input::Pressed(Shortcut::Dictation) => {
+                let repeat = self
+                    .last_press
+                    .is_some_and(|pressed| now.saturating_duration_since(pressed) < KEY_REPEAT_GAP);
+                self.last_press = Some(now);
+                match self.capture {
+                    _ if self.voice_held => None,
+                    Capture::Locked => {
+                        self.capture = Capture::Idle;
+                        self.last_release = None;
+                        Some(HotkeyEvent::Finish)
                     }
-                    self.capture = Capture::Held { second_tap };
-                    Some(HotkeyEvent::Start)
+                    Capture::Idle => {
+                        let second_tap = self.toggle
+                            || self.last_release.take().is_some_and(|released| {
+                                now.checked_duration_since(released)
+                                    .is_some_and(|gap| gap < DOUBLE_TAP_WINDOW)
+                            });
+                        if self.double_tap_only && !second_tap {
+                            self.capture = Capture::Armed;
+                            return None;
+                        }
+                        self.capture = Capture::Held { second_tap };
+                        Some(HotkeyEvent::Start)
+                    }
+                    // The desktop never sent the release that would have locked
+                    // this capture (Hyprland's Lua binds drop it when the
+                    // modifier comes up first), so this press finishes it.
+                    Capture::Held { second_tap: true } if !repeat => {
+                        self.capture = Capture::Idle;
+                        self.last_release = None;
+                        Some(HotkeyEvent::Finish)
+                    }
+                    Capture::Armed | Capture::Held { .. } => None,
                 }
-                Capture::Armed | Capture::Held { .. } => None,
-            },
+            }
             Input::Released(Shortcut::Dictation) => match self.capture {
                 Capture::Armed => {
                     self.capture = Capture::Idle;
@@ -482,6 +775,8 @@ impl ShortcutState {
                 self.idle().then_some(HotkeyEvent::PasteLast)
             }
             Input::Released(Shortcut::PasteLast) => None,
+            Input::Pressed(Shortcut::Capture) => Some(HotkeyEvent::Capture),
+            Input::Released(Shortcut::Capture) => None,
             Input::Command(command) => match command {
                 ShortcutCommand::DictationStart => self.start_dictation(),
                 ShortcutCommand::DictationStop => self.stop_dictation(),
@@ -518,6 +813,7 @@ pub(crate) struct Dispatcher {
     state: ShortcutState,
     sender: SyncSender<HotkeyEvent>,
     commands: CommandQueue,
+    keys: ShortcutKeys,
     pending: Vec<HotkeyEvent>,
 }
 
@@ -526,11 +822,13 @@ impl Dispatcher {
         options: &HotkeyOptions,
         sender: SyncSender<HotkeyEvent>,
         commands: CommandQueue,
+        keys: ShortcutKeys,
     ) -> Self {
         Self {
             state: ShortcutState::new(options),
             sender,
             commands,
+            keys,
             pending: Vec::new(),
         }
     }
@@ -557,6 +855,7 @@ impl Dispatcher {
         let queued: Vec<_> = commands.try_iter().collect();
         drop(commands);
         for command in queued {
+            self.keys.command();
             self.input(Input::Command(command));
         }
     }
@@ -606,13 +905,14 @@ impl LinuxHotkeyMonitor {
         let worker_stop = stop.clone();
         let worker_started = started.clone();
         let worker = thread::spawn(move || {
+            let keys = status.keys();
             let backend = Backend {
                 stop: worker_stop,
                 ready: ready_sender.clone(),
                 started: worker_started.clone(),
                 status,
             };
-            let dispatcher = Dispatcher::new(&options, sender, commands);
+            let dispatcher = Dispatcher::new(&options, sender, commands, keys);
             let result = match session {
                 LinuxSession::X11 => backend.run_x11(dispatcher, binding, options),
                 LinuxSession::Wayland => backend.run_wayland(dispatcher, binding, options),
@@ -728,36 +1028,69 @@ impl Backend {
                 .voice_action
                 .as_ref()
                 .map(|key| (Shortcut::VoiceAction, key)),
+            options.capture.as_ref().map(|key| (Shortcut::Capture, key)),
         ];
         let mut shortcuts = Vec::new();
         for (shortcut, key) in requested.into_iter().flatten() {
             let (id, description) = shortcut.portal_id();
+            // Keep keyboard shortcuts usable after moving X11 settings to
+            // Wayland. Mouse actions remain available through the CLI.
+            if mouse_button(&key.key).is_some() {
+                continue;
+            }
             shortcuts.push(crate::linux_portal::Shortcut {
                 id,
                 description,
                 trigger: key.portal_trigger()?,
             });
         }
-        let granted = portal.bind(&shortcuts, &self.stop)?;
-        let granted = shortcuts
-            .iter()
-            .map(|shortcut| DesktopGrantedShortcut {
-                name: shortcut.description.into(),
-                trigger: granted
-                    .get(shortcut.id)
-                    .map(|trigger| crate::linux_portal::readable_trigger(trigger)),
+        let granted = if shortcuts.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            portal.bind(&shortcuts, &self.stop)?
+        };
+        let project = |granted: &std::collections::HashMap<String, Option<String>>| {
+            requested
+                .iter()
+                .flatten()
+                .map(|(shortcut, _)| DesktopGrantedShortcut {
+                    name: shortcut.portal_id().1.into(),
+                    trigger: granted
+                        .get(shortcut.portal_id().0)
+                        .and_then(Option::as_deref)
+                        .map(crate::linux_portal::readable_trigger),
+                })
+                .collect::<Vec<_>>()
+        };
+        let modifiers = |granted: &std::collections::HashMap<String, Option<String>>| {
+            Shortcut::ALL.map(|shortcut| {
+                requested.iter().flatten().any(|(requested, key)| {
+                    *requested == shortcut
+                        && trigger_has_modifiers(
+                            granted
+                                .get(shortcut.portal_id().0)
+                                .and_then(Option::as_deref),
+                            key,
+                        )
+                })
             })
-            .collect::<Vec<_>>();
+        };
+        let mut with_modifiers = modifiers(&granted);
+        let granted = project(&granted);
         for shortcut in granted.iter().filter(|shortcut| shortcut.trigger.is_none()) {
             tracing::warn!(name = %shortcut.name, "the desktop did not grant a Hex shortcut");
         }
+        self.status
+            .configurable
+            .store(portal.configurable(), Ordering::Release);
+        self.status.configure.store(false, Ordering::Release);
         self.mark_ready(DesktopShortcuts::Portal(granted));
         // Escape while the recording shortcut is still held carries its modifiers.
         let held_escape = |shortcut: Shortcut| -> Option<String> {
             let key = match shortcut {
                 Shortcut::Dictation => Some(&binding),
                 Shortcut::VoiceAction => options.voice_action.as_ref(),
-                Shortcut::PasteLast => None,
+                Shortcut::PasteLast | Shortcut::Capture => None,
             }?;
             let trigger = key.portal_trigger_for("Escape").ok()?;
             (trigger != "Escape").then_some(trigger)
@@ -777,14 +1110,31 @@ impl Backend {
                         Input::Escape
                     }
                     crate::linux_portal::Event::Pressed(id) => match shortcut_for(&id) {
-                        Some(shortcut) => Input::Pressed(shortcut),
+                        Some(shortcut) => {
+                            if with_modifiers[shortcut.index()] {
+                                dispatcher.keys.pressed(shortcut);
+                            }
+                            Input::Pressed(shortcut)
+                        }
                         None => continue,
                     },
                     crate::linux_portal::Event::Released(id) => match shortcut_for(&id) {
-                        Some(shortcut) => Input::Released(shortcut),
+                        Some(shortcut) => {
+                            if with_modifiers[shortcut.index()] {
+                                dispatcher.keys.released(shortcut);
+                            }
+                            Input::Released(shortcut)
+                        }
                         None => continue,
                     },
+                    crate::linux_portal::Event::Changed(changed) => {
+                        with_modifiers = modifiers(&changed);
+                        self.status
+                            .set_shortcuts(DesktopShortcuts::Portal(project(&changed)));
+                        continue;
+                    }
                     crate::linux_portal::Event::Closed => {
+                        dispatcher.keys.released_all();
                         dispatcher.input(Input::Lost);
                         let _ = dispatcher.flush();
                         return Err(eyre!("the desktop closed Hex's shortcuts portal session"));
@@ -793,6 +1143,14 @@ impl Backend {
                 dispatcher.input(input);
             }
             dispatcher.commands();
+            if self.status.configure.swap(false, Ordering::AcqRel)
+                && let Err(error) = portal.configure()
+            {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not open the desktop's shortcut settings"
+                );
+            }
             // Accepted output remains cancellable after its shortcut releases.
             let wants_escape = self.status.wants_escape(dispatcher.state.wants_escape());
             if wants_escape && !escape_bound {
@@ -839,13 +1197,20 @@ impl Backend {
             Some((Shortcut::Dictation, binding)),
             options.paste_last.map(|key| (Shortcut::PasteLast, key)),
             options.voice_action.map(|key| (Shortcut::VoiceAction, key)),
+            options.capture.map(|key| (Shortcut::Capture, key)),
         ];
         for (shortcut, key) in requested.into_iter().flatten() {
-            let code = keymap.keycode(keysym(&key.key)?)?;
+            let mouse = mouse_button(&key.key);
+            let code = match mouse {
+                Some(button) => button,
+                None => keymap.keycode(keysym(&key.key)?)?,
+            };
             let mask = key.modifier_mask(&connection, &keymap)?;
-            grabs.grab(shortcut, code, mask).wrap_err_with(|| {
-                format!("{} is already in use by another X11 client", key.label())
-            })?;
+            grabs
+                .grab(shortcut, code, mask, mouse.is_some())
+                .wrap_err_with(|| {
+                    format!("{} is already in use by another X11 client", key.label())
+                })?;
         }
         connection.flush()?;
         self.mark_ready(DesktopShortcuts::Registered);
@@ -865,22 +1230,51 @@ impl Backend {
                         escape_down = false;
                     }
                     Event::KeyPress(event) => {
-                        let mask = u16::from(event.state) & !lock_bits;
+                        let mask = u16::from(event.state) & 0xff & !lock_bits;
                         let shortcut = grabs
                             .keys
                             .iter()
-                            .find(|grab| grab.code == event.detail && grab.mask == mask)
+                            .find(|grab| {
+                                !grab.mouse && grab.code == event.detail && grab.mask == mask
+                            })
                             .or_else(|| {
                                 grabs.keys.iter().find(|grab| {
-                                    grab.code == event.detail && keys.held(grab.shortcut)
+                                    !grab.mouse
+                                        && grab.code == event.detail
+                                        && keys.held(grab.shortcut)
                                 })
                             })
                             .map(|grab| grab.shortcut);
                         inputs.extend(shortcut.and_then(|shortcut| keys.press(shortcut)));
                     }
                     Event::KeyRelease(event) => {
-                        for grab in grabs.keys.iter().filter(|grab| grab.code == event.detail) {
+                        for grab in grabs
+                            .keys
+                            .iter()
+                            .filter(|grab| !grab.mouse && grab.code == event.detail)
+                        {
                             keys.release(grab.shortcut, Instant::now());
+                        }
+                    }
+                    Event::ButtonPress(event) => {
+                        let mask = u16::from(event.state) & 0xff & !lock_bits;
+                        if let Some(grab) = grabs.keys.iter().find(|grab| {
+                            grab.mouse && grab.code == event.detail && grab.mask == mask
+                        }) {
+                            inputs.extend(keys.press(grab.shortcut));
+                        }
+                    }
+                    Event::ButtonRelease(event) => {
+                        for grab in grabs
+                            .keys
+                            .iter()
+                            .filter(|grab| grab.mouse && grab.code == event.detail)
+                        {
+                            // Buttons do not autorepeat: preserve the release boundary.
+                            if keys.held[grab.shortcut.index()] {
+                                keys.held[grab.shortcut.index()] = false;
+                                inputs.push(Input::Released(grab.shortcut));
+                            }
                         }
                     }
                     _ => {}
@@ -916,8 +1310,8 @@ impl Backend {
 /// [`RELEASE_GRACE`] passes without a new press.
 #[derive(Default)]
 struct X11Keys {
-    held: [bool; 3],
-    releasing: [Option<Instant>; 3],
+    held: [bool; Shortcut::ALL.len()],
+    releasing: [Option<Instant>; Shortcut::ALL.len()],
 }
 
 impl X11Keys {
@@ -958,6 +1352,7 @@ impl X11Keys {
 }
 
 struct X11Grab {
+    mouse: bool,
     shortcut: Shortcut,
     code: u8,
     mask: u16,
@@ -975,10 +1370,44 @@ struct X11Grabs<'a> {
 }
 
 impl X11Grabs<'_> {
-    fn grab(&mut self, shortcut: Shortcut, code: u8, mask: ModMask) -> Result<(), ReplyError> {
+    fn grab(
+        &mut self,
+        shortcut: Shortcut,
+        code: u8,
+        mask: ModMask,
+        mouse: bool,
+    ) -> Result<(), ReplyError> {
         let variants = lock_variants(mask, self.num_lock);
-        grab_variants(self.connection, self.root, code, &variants)?;
+        if mouse {
+            for (index, modifiers) in variants.iter().copied().enumerate() {
+                let result = self
+                    .connection
+                    .grab_button(
+                        false,
+                        self.root,
+                        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
+                        GrabMode::ASYNC,
+                        GrabMode::ASYNC,
+                        x11rb::NONE,
+                        x11rb::NONE,
+                        ButtonIndex::from(code),
+                        modifiers,
+                    )?
+                    .check();
+                if let Err(error) = result {
+                    for previous in &variants[..index] {
+                        self.connection
+                            .ungrab_button(ButtonIndex::from(code), self.root, *previous)?
+                            .check()?;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            grab_variants(self.connection, self.root, code, &variants)?;
+        }
         self.keys.push(X11Grab {
+            mouse,
             shortcut,
             code,
             mask: u16::from(mask),
@@ -1015,7 +1444,15 @@ impl Drop for X11Grabs<'_> {
         }
         for grab in &self.keys {
             for modifiers in grab.variants {
-                let _ = self.connection.ungrab_key(grab.code, self.root, modifiers);
+                if grab.mouse {
+                    let _ = self.connection.ungrab_button(
+                        ButtonIndex::from(grab.code),
+                        self.root,
+                        modifiers,
+                    );
+                } else {
+                    let _ = self.connection.ungrab_key(grab.code, self.root, modifiers);
+                }
             }
         }
         let _ = self.connection.flush();
@@ -1240,6 +1677,148 @@ mod tests {
     }
 
     #[test]
+    fn mouse_numbering_skips_wheel_buttons_and_round_trips() {
+        for (name, native) in [
+            ("mouse1", 1),
+            ("mouse2", 3),
+            ("mouse3", 2),
+            ("mouse4", 8),
+            ("mouse5", 9),
+            ("mouse32", 36),
+        ] {
+            assert_eq!(mouse_button(name), Some(native));
+            assert_eq!(mouse_name(native).as_deref(), Some(name));
+            let key = LinuxHotkey {
+                key: name.into(),
+                ..LinuxHotkey::default()
+            };
+            assert_eq!(LinuxHotkey::from(&HotkeyBinding::from(&key)), key);
+            assert!(
+                key.portal_trigger().is_err(),
+                "the XDG portal has no mouse trigger syntax"
+            );
+        }
+        for wheel in 4..=7 {
+            assert_eq!(mouse_name(wheel), None);
+        }
+        assert_eq!(mouse_button("mouse33"), None);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 server (Xvfb)"]
+    fn x11_mouse_grab_delivers_hold_and_release() {
+        let harness = X11TestHarness::new();
+        let binding = LinuxHotkey {
+            control: false,
+            alt: false,
+            shift: false,
+            super_key: false,
+            key: "mouse4".into(),
+        };
+        let (monitor, _commands) = x11_monitor(binding, double_tap(), Default::default());
+        send_key(&harness.connection, harness.root, 4, 8);
+        assert_eq!(recv_event(&monitor), HotkeyEvent::Start);
+        send_key(&harness.connection, harness.root, 5, 8);
+        assert_eq!(recv_event(&monitor), HotkeyEvent::Finish);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated X11 server (Xvfb)"]
+    fn x11_mouse_recorder_captures_auxiliary_button_and_releases_its_grab() {
+        use x11rb::protocol::xproto::{
+            AtomEnum, CreateWindowAux, InputFocus, PropMode, WindowClass,
+        };
+        use x11rb::wrapper::ConnectionExt as _;
+        let harness = X11TestHarness::new();
+        let c = &harness.connection;
+        let window = c.generate_id().unwrap();
+        c.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            harness.root,
+            0,
+            0,
+            200,
+            200,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        let atom = c
+            .intern_atom(false, b"_NET_WM_PID")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        c.change_property32(
+            PropMode::REPLACE,
+            window,
+            atom,
+            AtomEnum::CARDINAL,
+            &[std::process::id()],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        c.map_window(window).unwrap().check().unwrap();
+        c.set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        c.warp_pointer(x11rb::NONE, window, 0, 0, 0, 0, 50, 50)
+            .unwrap()
+            .check()
+            .unwrap();
+        send_key(c, harness.root, 4, 1);
+        let mut capture = MouseCapture::start().unwrap();
+        assert!(capture.poll().unwrap().is_none());
+        assert!(
+            !capture.grabbed,
+            "the opening click must not become the binding"
+        );
+        send_key(c, harness.root, 5, 1);
+        assert!(capture.poll().unwrap().is_none());
+        assert!(capture.grabbed);
+        send_key(c, harness.root, 4, 9);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let captured = loop {
+            if let Some(binding) = capture.poll().unwrap() {
+                break binding;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(captured.key, "mouse5");
+        send_key(c, harness.root, 5, 9);
+        drop(capture);
+        let status = c
+            .grab_pointer(
+                false,
+                window,
+                EventMask::BUTTON_PRESS,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                x11rb::CURRENT_TIME,
+            )
+            .unwrap()
+            .reply()
+            .unwrap()
+            .status;
+        assert_eq!(status, x11rb::protocol::xproto::GrabStatus::SUCCESS);
+        c.ungrab_pointer(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        c.destroy_window(window).unwrap().check().unwrap();
+    }
+
+    #[test]
     fn default_binding_is_alt_space() {
         assert_eq!(LinuxHotkey::default().label(), "Alt+Space");
     }
@@ -1315,8 +1894,12 @@ mod tests {
         let status = HotkeyStatus::default();
         let observer = status.clone();
         let (sender, events) = mpsc::sync_channel(4);
-        let mut dispatcher =
-            Dispatcher::new(&HotkeyOptions::default(), sender, mpsc::channel().1.into());
+        let mut dispatcher = Dispatcher::new(
+            &HotkeyOptions::default(),
+            sender,
+            mpsc::channel().1.into(),
+            Default::default(),
+        );
         assert!(!observer.wants_escape(dispatcher.state.wants_escape()));
         status.set_output_pending(true);
         assert!(observer.wants_escape(dispatcher.state.wants_escape()));
@@ -1421,6 +2004,51 @@ mod tests {
             test.input(Input::Escape);
             assert_eq!(test.events, [Start, Finish, Start, Cancel]);
         }
+    }
+
+    #[test]
+    fn a_capture_that_would_lock_finishes_when_the_desktop_drops_its_release() {
+        // Hyprland's Lua binds send no release when Alt comes up before Z.
+        for toggle in [true, false] {
+            let mut test = Test::with(HotkeyOptions {
+                double_tap: !toggle,
+                toggle,
+                ..HotkeyOptions::default()
+            });
+            if !toggle {
+                test.tap();
+                test.now += Duration::from_millis(20);
+            }
+            test.press(Shortcut::Dictation);
+            assert_eq!(test.state.capture, Capture::Held { second_tap: true });
+            test.events.clear();
+            test.now += Duration::from_secs(5);
+            test.press(Shortcut::Dictation);
+            assert_eq!(test.events, [Finish]);
+            assert_eq!(test.state.capture, Capture::Idle);
+            test.release(Shortcut::Dictation);
+            test.now += Duration::from_secs(1);
+            test.press(Shortcut::Dictation);
+            assert_eq!(test.events, [Finish, Start]);
+        }
+    }
+
+    #[test]
+    fn a_repeating_held_press_never_finishes_the_capture() {
+        // KWin repeats a held global shortcut's press.
+        let mut test = Test::with(HotkeyOptions {
+            toggle: true,
+            ..HotkeyOptions::default()
+        });
+        test.press(Shortcut::Dictation);
+        test.now += Duration::from_millis(900);
+        for _ in 0..100 {
+            test.press(Shortcut::Dictation);
+            test.now += Duration::from_millis(40);
+        }
+        test.release(Shortcut::Dictation);
+        assert_eq!(test.events, [Start]);
+        assert_eq!(test.state.capture, Capture::Locked);
     }
 
     #[test]
@@ -1816,6 +2444,43 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_waits_for_a_modifier_shortcut_to_let_go() {
+        let keys = HeldKeys::default();
+        assert_eq!(keys.quiet_at(), None);
+        let now = Instant::now();
+        let held = HeldKeys {
+            held: 1 << Shortcut::PasteLast.index(),
+            last: Some(now),
+        };
+        assert_eq!(held.quiet_at(), Some(now + HELD_LIMIT));
+        let released = HeldKeys {
+            held: 0,
+            last: Some(now),
+        };
+        assert_eq!(released.quiet_at(), Some(now + MODIFIER_GRACE));
+    }
+
+    #[test]
+    fn granted_triggers_decide_whether_a_shortcut_holds_modifiers() {
+        let alt_space = LinuxHotkey::default();
+        assert!(trigger_has_modifiers(None, &alt_space));
+        assert!(trigger_has_modifiers(Some(""), &alt_space));
+        assert!(!trigger_has_modifiers(Some("Press End"), &alt_space));
+        assert!(trigger_has_modifiers(
+            Some("Press <ctrl><alt>v"),
+            &alt_space
+        ));
+        let end = LinuxHotkey {
+            control: false,
+            alt: false,
+            shift: false,
+            super_key: false,
+            key: "End".into(),
+        };
+        assert!(!trigger_has_modifiers(None, &end));
+    }
+
+    #[test]
     fn escape_warning_is_logged_once_per_episode_and_clears_on_recovery() {
         let status = HotkeyStatus::default();
         let observer = status.clone();
@@ -1872,6 +2537,7 @@ mod tests {
                 &HotkeyOptions::default(),
                 sender,
                 receiver.into(),
+                ShortcutKeys::default(),
             ))
         });
         readiness.recv().unwrap().unwrap();

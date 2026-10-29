@@ -37,15 +37,10 @@ fn permission_copy(
             tr("Microphone"),
             tr("Hex cannot record dictation until microphone access is restored."),
         ),
-        PermissionKind::InputMonitoring => (
-            "permission-input-monitoring",
-            tr("Input Monitoring"),
-            tr("Hex cannot recognize the dictation shortcut in other apps."),
-        ),
         PermissionKind::Accessibility => (
             "permission-accessibility",
             accessibility_name(accessibility_renamed),
-            tr("Hex cannot paste completed dictation into the foreground app."),
+            tr("Hex cannot recognize the dictation shortcut or paste into other apps."),
         ),
         PermissionKind::SystemAudio => (
             "permission-system-audio",
@@ -462,6 +457,7 @@ fn calendars_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
                 } else {
                     format!("{} · {}", info.title, info.source)
                 },
+                detail: None,
                 selected: calendar.includes(&info.id),
                 choose: Box::new(move |ui: &mut Ui| {
                     let id = id.clone();

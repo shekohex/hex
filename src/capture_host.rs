@@ -1,6 +1,10 @@
-//! The `capture` experiment (macOS builds with the `capture` build option):
-//! Scrawl's capture engine, the `scrawl-capture` crate, hosted inside Hex.
-//! Step 3 of `docs/plans/capture-in-hex.md`.
+//! The `capture` experiment (macOS and Linux): Scrawl's capture engine, the
+//! `scrawl-capture` crate, hosted inside Hex. Step 3 of
+//! `docs/plans/capture-in-hex.md`. Everything here is shared; what differs
+//! by OS is the engine's own platform adapter (ScreenCaptureKit, or the
+//! portal, PipeWire and VA-API), where the audio timeline comes from
+//! (`DictationAudio` on macOS, the Linux listener's [`ListenerTimeline`]),
+//! "While dictating" ([`Environment`]), the transcriber, and the clipboard.
 //!
 //! The engine records the screen and writes the bundle; Hex owns the
 //! microphone and the model. A capture copies audio from the dictation
@@ -17,6 +21,11 @@
 //! capture's `InputSink` through the engine's pure input rules
 //! (`scrawl_capture::hosted_input`).
 //!
+//! While a capture records it holds a recording-environment session with
+//! "While dictating" (`recording_audio_behavior`, read at each start),
+//! released when it stops, is cancelled, or Hex quits; dictation's own
+//! session composes with it.
+//!
 //! Views never reach into the host: every change to a capture (started,
 //! the screen recording, stopped, the engine's stages, settled) publishes
 //! one [`CaptureSnapshot`], which [`snapshot`] reads and [`watch`] wakes on.
@@ -27,7 +36,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -40,7 +49,9 @@ use scrawl_capture::capture::{
 use scrawl_capture::handoff::EngineConfig;
 use scrawl_capture::hosted_input::{HostInput, HostedInput, Modifiers};
 use scrawl_capture::model::{TranscriptData, WordTiming};
-use scrawl_capture::transcribe::{AppleTranscriber, Transcriber};
+#[cfg(target_os = "macos")]
+use scrawl_capture::transcribe::AppleTranscriber;
+use scrawl_capture::transcribe::Transcriber;
 
 use crate::audio::CaptureInstant;
 use crate::control::{
@@ -48,19 +59,47 @@ use crate::control::{
     ScrawlCaptureState,
 };
 use crate::dictation::StreamingResampler;
-use crate::dictation_audio::{CaptureAudio, CaptureSinkClosed, DictationAudio};
-use crate::transcription::TranscriptSegment;
+#[cfg(target_os = "macos")]
+use crate::dictation_audio::DictationAudio;
+#[cfg(target_os = "macos")]
+pub use crate::recording_environment::RecordingEnvironmentController as Environment;
+#[cfg(target_os = "macos")]
+use crate::recording_environment::RecordingEnvironmentSession as Quiet;
 use crate::transcription_engine::TranscriptionEngine;
 use crate::transcription_models::{ModelRuntime, TranscriptionModelId};
 
 mod library;
 mod routing;
+mod sink;
 
 pub use library::{
     explain as explain_capture, list as list_captures, send as send_capture, show as show_capture,
 };
 pub use routing::CaptureRoute;
 pub use routing::{RouteAnswer, RouteDelivery, RouteDest};
+#[cfg(target_os = "macos")]
+pub use sink::CaptureSink;
+#[cfg(target_os = "linux")]
+pub use sink::ListenerTimeline;
+pub use sink::{CaptureAudio, CaptureSinkClosed};
+
+/// "While dictating" for a capture on Linux: its own audio suppressor, made
+/// when the capture starts and restoring what it changed when dropped.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+pub struct Environment;
+
+#[cfg(target_os = "linux")]
+type Quiet = crate::linux_audio_control::AudioSuppressor;
+
+#[cfg(target_os = "linux")]
+impl Environment {
+    fn begin_capture(&self, behavior: crate::app_settings::RecordingAudioBehavior) -> Quiet {
+        let quiet = Quiet::new(behavior);
+        quiet.suppress();
+        quiet
+    }
+}
 
 /// The sink's capacity in microphone chunks (about 10 ms each): seconds of
 /// slack before a stalled collector starts dropping audio as a gap.
@@ -103,6 +142,13 @@ trait CaptureEngine: Send + Sync + 'static {
         Ok(match target {
             CaptureTarget::Pointer => Target::ActiveDisplay,
             CaptureTarget::Display { at } => Target::Screen(discover_target_at(None, Some(at))),
+            // Wayland lists no windows: the portal's own picker chooses one.
+            #[cfg(target_os = "linux")]
+            CaptureTarget::Window { .. } => Target::Screen(scrawl_capture::model::TargetInfo {
+                mode: scrawl_capture::model::CaptureMode::Window,
+                ..discover_target_at(None, None)
+            }),
+            #[cfg(not(target_os = "linux"))]
             CaptureTarget::Window { id } => Target::Screen(
                 list_selectable_windows()
                     .into_iter()
@@ -363,7 +409,23 @@ fn own_windows_of(own: &[Option<u32>; 3]) -> OwnWindows {
             .into_iter()
             .filter_map(|role| own[role as usize])
             .collect(),
+        recorded: Arc::clone(&OWN_WINDOWS_RECORDED),
     }
+}
+
+/// `capture.show_overlays_in_recordings`: while set, a capture records every
+/// window of Hex's, its overlays included. A recording capture follows a
+/// change at once.
+static OWN_WINDOWS_RECORDED: LazyLock<Arc<AtomicBool>> = LazyLock::new(Arc::default);
+
+/// Lets captures record Hex's own windows, or leaves them out again.
+pub fn record_own_windows(recorded: bool) {
+    OWN_WINDOWS_RECORDED.store(recorded, Ordering::Release);
+}
+
+/// Whether screen recordings may show Hex's overlays, as last saved.
+pub fn own_windows_recorded() -> bool {
+    OWN_WINDOWS_RECORDED.load(Ordering::Acquire)
 }
 
 /// The capsule's pill `[x, y, w, h]` in its panel's points while it shows.
@@ -481,6 +543,14 @@ fn hex_engine_config() -> EngineConfig {
 /// transcriber; replaced when a listener starts captures.
 static DICTATION_ENGINE: Mutex<Option<Weak<TranscriptionEngine>>> = Mutex::new(None);
 
+/// Points captures at the listener's new engine after a model change.
+#[cfg(target_os = "linux")]
+pub fn use_engine(engine: &Arc<TranscriptionEngine>) {
+    *DICTATION_ENGINE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(Arc::downgrade(engine));
+}
+
 /// The process's one capture engine (it keeps process-global state), made
 /// the first time captures turn on.
 fn shared_engine(
@@ -493,6 +563,11 @@ fn shared_engine(
     let mut engine = ENGINE.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(engine) = &*engine {
         return Ok(engine.clone());
+    }
+    // The portal remembers the screen Hex was given; the token is Hex's.
+    #[cfg(target_os = "linux")]
+    if let Ok(support) = crate::app_paths::support_dir() {
+        scrawl_capture::linux::set_token_path(support.join("screencast-token"));
     }
     let (events, received) = mpsc::sync_channel(EVENT_CAPACITY);
     thread::Builder::new()
@@ -516,9 +591,19 @@ impl Transcriber for ChosenTranscriber {
                     .clone(),
             }
             .transcribe(audio),
+            #[cfg(target_os = "macos")]
             crate::app_settings::CaptureTranscriber::Apple => {
                 AppleTranscriber::default().transcribe(audio)
             }
+            // Apple's SpeechAnalyzer is macOS's; elsewhere it is Hex's model.
+            #[cfg(not(target_os = "macos"))]
+            crate::app_settings::CaptureTranscriber::Apple => HexTranscriber {
+                engine: DICTATION_ENGINE
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+            }
+            .transcribe(audio),
         }
     }
 }
@@ -543,16 +628,83 @@ impl Transcriber for HexTranscriber {
                 .map_err(|error| anyhow::anyhow!(error))?
         };
         let (_, selection) = crate::app_settings::transcription_selection();
-        let transcript = crate::parakeet::transcribe_with_words(engine, &selection, samples)
+        let (text, words) = transcribe_words(engine, &selection, samples)
             .map_err(|error| anyhow::anyhow!("{error:#}"))?;
         Ok(Some(TranscriptData {
             source: "hex".into(),
             model: Some(selection.model.as_str().into()),
-            text: transcript.text,
-            words: corrected_words(transcript.words, word_lag(selection.model)),
+            text,
+            words: corrected_words(words, word_lag(selection.model)),
             ..TranscriptData::default()
         }))
     }
+}
+
+/// One word and its times, in ms from the clip's start.
+pub struct TimedWord {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+/// The clip's text and words on the dictation engine's warm model.
+#[cfg(target_os = "macos")]
+fn transcribe_words(
+    engine: &Weak<TranscriptionEngine>,
+    selection: &crate::transcription_models::TranscriptionSelection,
+    samples: Vec<f32>,
+) -> Result<(String, Vec<TimedWord>)> {
+    let transcript = crate::parakeet::transcribe_with_words(engine, selection, samples)?;
+    let words = transcript
+        .words
+        .into_iter()
+        .map(|word| TimedWord {
+            start_ms: word.start_ms,
+            end_ms: word.end_ms,
+            text: word.text,
+        })
+        .collect();
+    Ok((transcript.text, words))
+}
+
+/// The clip's text and words, as one foreground request on the Linux
+/// listener's engine: after the dictation already sent, never inside a live
+/// stream. Its model is whatever the listener has loaded.
+#[cfg(target_os = "linux")]
+fn transcribe_words(
+    engine: &Weak<TranscriptionEngine>,
+    _selection: &crate::transcription_models::TranscriptionSelection,
+    samples: Vec<f32>,
+) -> Result<(String, Vec<TimedWord>)> {
+    if samples.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+    let (send, transcript) = mpsc::sync_channel(1);
+    let offline: crate::transcription_engine::Offline = Box::new(move |model, samples| {
+        let (text, words) = model
+            .transcribe_words(&samples)
+            .map_err(|error| format!("{error:#}"))?;
+        let _ = send.send((text.clone(), words));
+        Ok(text)
+    });
+    engine
+        .upgrade()
+        .ok_or_else(|| eyre!("the transcription engine stopped"))?
+        .foreground(samples, offline)?
+        .wait()
+        .map_err(|error| eyre!(error))?;
+    let (text, words) = transcript
+        .try_recv()
+        .map_err(|_| eyre!("the transcription returned no words"))?;
+    let words = words
+        .into_iter()
+        .map(|(start_ms, end_ms, text)| TimedWord {
+            start_ms,
+            end_ms,
+            text,
+        })
+        .collect();
+    Ok((text, words))
 }
 
 /// How late a model's word times run, in ms: the median against Apple's
@@ -600,7 +752,7 @@ fn word_lag(model: TranscriptionModelId) -> Option<&'static WordLag> {
 /// ends no earlier than it starts, and starts and ends never go backwards.
 /// Neighbours may overlap a little, as Apple's times do: starts move further
 /// than ends.
-fn corrected_words(words: Vec<TranscriptSegment>, lag: Option<&WordLag>) -> Vec<WordTiming> {
+fn corrected_words(words: Vec<TimedWord>, lag: Option<&WordLag>) -> Vec<WordTiming> {
     let mut previous_end: Option<i64> = None;
     let (mut floor_t0, mut floor_t1) = (0, 0);
     words
@@ -643,13 +795,21 @@ fn private_dirs(dir: &Path) -> Result<()> {
 }
 
 /// A fresh owner-only `<captures>/<unix ms>.scrawl` folder; never adopts one
-/// that exists.
+/// that exists. Stamps never repeat within the process: a discarded capture's
+/// folder is removed on its collector's thread, so a switch in the same
+/// millisecond could otherwise reuse its path while it is still unfinished.
 fn new_bundle_dir(captures_dir: &Path) -> Result<PathBuf> {
+    static LAST_STAMP: Mutex<u128> = Mutex::new(0);
     private_dirs(captures_dir)?;
-    let stamp = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
+    let stamp = {
+        let mut last = LAST_STAMP.lock().unwrap_or_else(|error| error.into_inner());
+        *last = now.max(*last + 1);
+        *last
+    };
     for attempt in 0..100 {
         let name = match attempt {
             0 => format!("{stamp}.scrawl"),
@@ -717,6 +877,7 @@ pub trait AudioTimeline {
     fn close_sink(&self, through: CaptureInstant) -> Result<Option<CaptureSinkClosed>>;
 }
 
+#[cfg(target_os = "macos")]
 impl AudioTimeline for DictationAudio {
     fn open_sink(&self, sink: SyncSender<CaptureAudio>, since: CaptureInstant) -> Result<()> {
         self.open_capture_sink(sink, since)
@@ -753,6 +914,8 @@ struct Active {
     target: TargetKind,
     seal: SyncSender<Seal>,
     collector: JoinHandle<()>,
+    /// "While dictating", held until the capture stops.
+    quiet: Option<Quiet>,
 }
 
 /// A stopped capture and its audio, waiting for the finisher.
@@ -1197,20 +1360,29 @@ pub struct CaptureHost {
     ended: Vec<JoinHandle<()>>,
     /// A `capture-phone` thread is looking for an iPhone.
     looking: Arc<AtomicBool>,
+    /// Mutes or pauses other audio while a capture records; `None` (a
+    /// replay) leaves it alone.
+    environment: Option<Environment>,
+    /// Tests pin the policy; captures otherwise follow "While dictating".
+    #[cfg(test)]
+    audio_behavior: Option<crate::app_settings::RecordingAudioBehavior>,
 }
 
 impl CaptureHost {
     /// The host when captures are on (the `capture` experiment and
     /// `capture.enabled`); otherwise `None`, and no engine, thread, sink, or
     /// folder is created.
-    pub fn start(engine: Option<Arc<TranscriptionEngine>>) -> Option<Self> {
+    pub fn start(
+        engine: Option<Arc<TranscriptionEngine>>,
+        environment: &Environment,
+    ) -> Option<Self> {
         if !crate::app_settings::capture_on() {
             return None;
         }
-        // scripts/validate-app.sh refuses a binary containing this line.
         tracing::info!("capture experiment on: `hex capture` is available");
         let host = shared_engine(engine.as_ref()).and_then(|engine| {
             let mut host = Self::with(engine, None)?;
+            host.environment = Some(environment.clone());
             host.start_retention()?;
             Ok(host)
         });
@@ -1223,6 +1395,7 @@ impl CaptureHost {
     pub fn reconcile(
         host: &mut Option<Self>,
         engine: Option<&Arc<TranscriptionEngine>>,
+        environment: &Environment,
         audio: &impl AudioTimeline,
     ) {
         static RETRY_AT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -1233,7 +1406,7 @@ impl CaptureHost {
                 if retry_at.is_some_and(|at| Instant::now() < at) {
                     return;
                 }
-                *host = Self::start(engine.cloned());
+                *host = Self::start(engine.cloned(), environment);
                 *retry_at = host.is_none().then(|| Instant::now() + START_RETRY);
             }
             (false, false) => {
@@ -1278,6 +1451,9 @@ impl CaptureHost {
             routes: Some(routes),
             ended: Vec::new(),
             looking: Arc::default(),
+            environment: None,
+            #[cfg(test)]
+            audio_behavior: None,
         })
     }
 
@@ -1321,7 +1497,10 @@ impl CaptureHost {
         let reply = self.control(action, audio);
         if let ControlReply::Error { code, message, .. } = &reply {
             tracing::warn!(code, message, "the capture shortcut did nothing");
+            #[cfg(target_os = "macos")]
             crate::feedback::play(crate::feedback::Tone::Error);
+            #[cfg(not(target_os = "macos"))]
+            crate::feedback::play(crate::feedback::Tone::CaptureFailed);
         }
         reply
     }
@@ -1372,7 +1551,7 @@ impl CaptureHost {
         let now = CaptureInstant::now();
         self.reap(now, audio);
         let result = match action {
-            ScrawlCaptureAction::Start => self.begin(now, audio, CaptureTarget::Pointer),
+            ScrawlCaptureAction::Start => self.begin(now, audio, CaptureTarget::Pointer, None),
             ScrawlCaptureAction::Stop => self.end(now, audio, End::Finish),
             ScrawlCaptureAction::Cancel => self.end(now, audio, End::Cancel),
             ScrawlCaptureAction::Status => Ok(self.report(false, None)),
@@ -1385,7 +1564,7 @@ impl CaptureHost {
         let now = CaptureInstant::now();
         self.reap(now, audio);
         let result = match command {
-            CaptureCommand::Start(target) => self.begin(now, audio, target),
+            CaptureCommand::Start(target) => self.begin(now, audio, target, None),
             CaptureCommand::FindPhone => {
                 self.find_phone();
                 Ok(self.report(false, None))
@@ -1495,9 +1674,11 @@ impl CaptureHost {
         }
         lock(&self.outcomes).held = true;
         let discarded = self.active.as_ref().map(|active| active.bundle.clone());
+        // Output stays muted or media paused from one capture to the next.
+        let quiet = self.active.as_mut().and_then(|active| active.quiet.take());
         let switched = self
             .end(now, audio, End::Discard)
-            .and_then(|_| self.begin(now, audio, target));
+            .and_then(|_| self.begin(now, audio, target, quiet));
         let mut outcomes = lock(&self.outcomes);
         if let (Some(bundle), true) = (discarded, self.active.is_none()) {
             let error = match &switched {
@@ -1509,6 +1690,19 @@ impl CaptureHost {
         }
         outcomes.release();
         switched
+    }
+
+    /// The session that applies "While dictating" to a capture starting
+    /// now. Sending it never blocks: the environment's own thread mutes or
+    /// pauses.
+    fn quiet(&self) -> Option<Quiet> {
+        let environment = self.environment.as_ref()?;
+        #[cfg(test)]
+        if let Some(behavior) = self.audio_behavior {
+            return Some(environment.begin_capture(behavior));
+        }
+        let behavior = crate::app_settings::recording_audio_behavior();
+        Some(environment.begin_capture(behavior))
     }
 
     /// Why no capture can start now, besides one already recording.
@@ -1529,11 +1723,14 @@ impl CaptureHost {
         })
     }
 
+    /// Starts a capture, holding "While dictating" with `quiet` when a
+    /// switch carries the previous capture's session over.
     fn begin(
         &mut self,
         now: CaptureInstant,
         audio: &impl AudioTimeline,
         target: CaptureTarget,
+        quiet: Option<Quiet>,
     ) -> Result<ControlReply> {
         if self.active.is_some() {
             return Ok(self.report(false, None));
@@ -1589,6 +1786,7 @@ impl CaptureHost {
             target: target.kind(),
             seal,
             collector,
+            quiet: quiet.or_else(|| self.quiet()),
         });
         self.find_phone();
         Ok(self.report(true, None))
@@ -1600,11 +1798,12 @@ impl CaptureHost {
         audio: &impl AudioTimeline,
         end: End,
     ) -> Result<ControlReply> {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return Ok(self.report(false, None));
         };
         // Input after the stop belongs to no capture.
         self.input.recording(None);
+        drop(active.quiet.take());
         let closed = audio.close_sink(now).unwrap_or_else(|error| {
             tracing::warn!(%error, "could not close the capture sink");
             None
@@ -1641,21 +1840,7 @@ impl CaptureHost {
             let spawned = std::thread::Builder::new()
                 .name("capture-hand-off".into())
                 .spawn(move || {
-                    let done = objc2::rc::autoreleasepool(|_| match how {
-                        // ⌘V from Hex's keyboard layout snapshot, marked as
-                        // Hex's: the crate's own reads TIS off the main thread.
-                        HandOff::Paste => {
-                            scrawl_capture::handoff::paste_bundle_with(&bundle, &|| {
-                                crate::keyboard::post_command('v')
-                                    .map_err(|error| anyhow::anyhow!("{error:#}"))
-                            })
-                        }
-                        HandOff::Inspect => scrawl_capture::handoff::load_bundle(&bundle).and_then(
-                            |(dir, loaded)| {
-                                scrawl_capture::handoff::open_path(&dir.join(loaded.contact_sheet))
-                            },
-                        ),
-                    });
+                    let done = hand_off(how, &bundle);
                     if let Err(error) = done {
                         tracing::warn!(
                             error = format!("{error:#}"),
@@ -1741,10 +1926,15 @@ fn watch_scrawl() {
 /// Whether Scrawl's own app (`dev.kitlangton.scrawl`) runs. Safe off the
 /// main thread.
 pub fn scrawl_running() -> bool {
-    objc2::rc::autoreleasepool(|_| scrawl_capture::capture::is_scrawl_app_running())
+    #[cfg(target_os = "macos")]
+    return objc2::rc::autoreleasepool(|_| scrawl_capture::capture::is_scrawl_app_running());
+    // Scrawl's app is macOS's.
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 /// Asks Scrawl's own app to quit, as "Use Hex for captures" does.
+#[cfg(target_os = "macos")]
 pub fn quit_scrawl() {
     use objc2_app_kit::NSRunningApplication;
     use objc2_foundation::NSString;
@@ -1762,6 +1952,7 @@ pub fn quit_scrawl() {
 // ---------------------------------------------------------------------------
 // Input from Hex's event tap.
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// What the session tap reports while a capture records.
 #[derive(Clone, Debug)]
 pub enum Tapped {
@@ -1783,13 +1974,14 @@ thread_local! {
 
 /// Runs `f` on this thread as if a capture recorded, and returns what the
 /// tap reported to it.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub fn tapped_while(f: impl FnOnce()) -> Vec<Tapped> {
     TEST_TAP.set(Some(Vec::new()));
     f();
     TEST_TAP.take().unwrap_or_default()
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Whether the session tap should report pointer and key input: only while
 /// a capture records.
 pub fn wants_input() -> bool {
@@ -1800,6 +1992,7 @@ pub fn wants_input() -> bool {
     TAP_RECORDING.load(Ordering::Acquire)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Called on the event tap's thread; never blocks. A full queue drops the
 /// event (counted, logged once the capture stops).
 pub fn report_input(at: CaptureInstant, input: Tapped) {
@@ -1977,6 +2170,7 @@ impl LiveInput {
                 .map_or(0, |since| since.as_millis() as u64);
             let input = match tapped {
                 Tapped::Pointer(input) => input,
+                #[cfg(target_os = "macos")]
                 Tapped::Key { code, flags } => HostInput::Key {
                     name: scrawl_capture::hosted_input::key_name(
                         code,
@@ -1985,6 +2179,9 @@ impl LiveInput {
                     z: crate::keyboard::key_code_for('z').is_ok_and(|z| z == code) || code == KEY_Z,
                     modifiers: modifiers(flags),
                 },
+                // Wayland reports no keys to Hex outside its own windows.
+                #[cfg(not(target_os = "macos"))]
+                Tapped::Key { .. } => continue,
             };
             let Some(event) = target.rules.translate(t_ms, input) else {
                 continue;
@@ -2029,6 +2226,68 @@ pub enum ShortcutActivity {
     },
 }
 
+/// A capture command from the capsule, for the listener that owns the host.
+#[derive(Debug)]
+pub enum CaptureControl {
+    Scrawl(ScrawlCaptureAction),
+    Command(CaptureCommand),
+}
+
+/// Hands `control` to the listener without waiting for it.
+#[cfg(target_os = "macos")]
+pub fn send_to_listener(control: CaptureControl) -> Result<()> {
+    use crate::recognition::RecognitionControl;
+    let runtime = crate::macos_rune::runtime().ok_or_else(|| eyre!("Hex is starting"))?;
+    let (reply, _) = mpsc::sync_channel(1);
+    runtime
+        .recognition(match control {
+            CaptureControl::Scrawl(action) => RecognitionControl::ScrawlCapture { action, reply },
+            CaptureControl::Command(command) => {
+                RecognitionControl::CaptureCommand { command, reply }
+            }
+        })
+        .map_err(|error| eyre!(error))
+}
+
+/// The Linux listener's queue of capsule commands, while one listens.
+#[cfg(target_os = "linux")]
+static LISTENER: Mutex<Option<SyncSender<CaptureControl>>> = Mutex::new(None);
+
+/// Hands `control` to the listener without waiting for it.
+#[cfg(target_os = "linux")]
+pub fn send_to_listener(control: CaptureControl) -> Result<()> {
+    LISTENER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .ok_or_else(|| eyre!("Hex is not listening"))?
+        .try_send(control)
+        .map_err(|_| eyre!("Hex is busy; try again"))
+}
+
+/// Makes the calling listener the one capsule commands reach.
+#[cfg(target_os = "linux")]
+pub fn listen_for_controls() -> Receiver<CaptureControl> {
+    let (send, receive) = mpsc::sync_channel(16);
+    *LISTENER.lock().unwrap_or_else(|error| error.into_inner()) = Some(send);
+    receive
+}
+
+impl ShortcutActivity {
+    /// What a press of a shortcut the desktop reports only as pressed (the
+    /// Linux portal and keybindings) asks for: it records at once.
+    #[cfg(target_os = "linux")]
+    pub fn on_press(self) -> ShortcutAction {
+        match self {
+            Self::Free => ShortcutAction::Record,
+            Self::Picking => ShortcutAction::Pick,
+            Self::Recording { elapsed } if elapsed < SHORTCUT_DEBOUNCE => ShortcutAction::None,
+            Self::Recording { .. } => ShortcutAction::Finish,
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// What a capture shortcut event asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShortcutAction {
@@ -2051,12 +2310,14 @@ pub enum ShortcutAction {
 /// never ends a recording. A press while
 /// recording finishes, except within [`SHORTCUT_DEBOUNCE`] of the start;
 /// autorepeats never count.
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 pub struct CaptureShortcut {
     held: Option<u16>,
     armed: Option<crate::app_settings::RuntimeHotkey>,
 }
 
+#[cfg(target_os = "macos")]
 impl CaptureShortcut {
     pub fn input(
         &mut self,
@@ -2154,8 +2415,9 @@ impl CaptureShortcut {
     }
 
     /// Whether Hex's tap keeps Escape from the app for captures: only for
-    /// this press before it records, and for the capsule's picker, list,
-    /// and Undo. A recording capture never takes it.
+    /// this press before it records, and for the capsule's picker. (An open
+    /// list takes Escape at the session tap.) A recording capture never
+    /// takes it, and a send's Undo is a click.
     pub fn takes_escape(&self) -> bool {
         self.armed() || wants_escape()
     }
@@ -2177,20 +2439,20 @@ pub enum CapsuleKeys {
     Picker,
     /// A routed capsule, or a hidden one whose capture still waits for a
     /// pick: the send-to list shortcut (`capture.list_hotkey`) opens its
-    /// list ([`CapsuleKey::OpenList`]), and Escape too while `escape` (a
-    /// send that can still be undone).
-    Route { escape: bool },
-    /// A send from the list waiting out its Undo: Escape takes it back.
-    Undo,
+    /// list ([`CapsuleKey::OpenList`]). Never Escape: it goes to the app in
+    /// front, and a send is taken back only by clicking Undo.
+    Route,
     /// The open list: every key press without ⌘ or ⌃ that isn't one of
     /// Hex's shortcuts.
     List,
-    /// A capture's suggestions: Escape, the send-to list shortcut (search
-    /// every session), and 1 to `rows` with no modifier
-    /// ([`CapsuleKey::Digit`]).
-    Suggest { rows: u8 },
+    /// A capture's suggestions: the send-to list shortcut (search every
+    /// session), 1 to `rows` with no modifier ([`CapsuleKey::Digit`]), and
+    /// a mouse press ([`CapsuleKey::Press`]) that may fold them. `cycle`:
+    /// Return and Tab too, for the toast that offers one guess at a time.
+    Suggest { rows: u8, cycle: bool },
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// A key the capsule gets from Hex's tap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CapsuleKey {
@@ -2208,8 +2470,15 @@ pub enum CapsuleKey {
     Return {
         shift: bool,
     },
-    /// 1 to 9 typed in the list (otherwise text).
+    /// Tab, ⇧ for back: the toast's next guess.
+    Tab {
+        shift: bool,
+    },
+    /// 1 to 9 typed in the list (otherwise text), with Shift too: a
+    /// Shift pick also saves a rule.
     Digit(u8),
+    /// Shift went down (true) or up while the list or suggestions show.
+    Shift(bool),
     /// A mouse button went down anywhere, while the list is open. The click
     /// still reaches the app under it.
     Press,
@@ -2233,10 +2502,8 @@ fn keys_code(keys: Option<CapsuleKeys>) -> u8 {
     match keys {
         None => 0,
         Some(CapsuleKeys::Picker) => 1,
-        Some(CapsuleKeys::Route { escape: false }) => 2,
-        Some(CapsuleKeys::Route { escape: true }) => 3,
+        Some(CapsuleKeys::Route) => 2,
         Some(CapsuleKeys::List) => 4,
-        Some(CapsuleKeys::Undo) => 5,
         Some(CapsuleKeys::Suggest { .. }) => 6,
     }
 }
@@ -2292,11 +2559,14 @@ pub fn picking() -> bool {
     GRAB_KEYS.load(Ordering::Acquire) == keys_code(Some(CapsuleKeys::Picker))
 }
 
-/// Whether the capsule takes Escape from the listener.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Whether the capsule takes Escape from the listener: only the picker
+/// (the open list takes it at the tap).
 pub fn wants_escape() -> bool {
-    matches!(GRAB_KEYS.load(Ordering::Acquire), 1 | 3 | 5 | 6)
+    GRAB_KEYS.load(Ordering::Acquire) == keys_code(Some(CapsuleKeys::Picker))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Whether the open list takes every key press at the tap.
 pub fn list_open() -> bool {
     GRAB_KEYS.load(Ordering::Acquire) == keys_code(Some(CapsuleKeys::List))
@@ -2306,12 +2576,17 @@ pub fn list_open() -> bool {
 /// match it (`app_settings::runtime_hotkeys`), so it reaches the app in
 /// front the rest of the time.
 pub fn list_key_wanted() -> bool {
-    matches!(GRAB_KEYS.load(Ordering::Acquire), 2..=4 | 6)
+    matches!(GRAB_KEYS.load(Ordering::Acquire), 2 | 4 | 6)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Whether the capsule's suggestions take their digit keys at the tap.
 pub fn suggesting() -> bool {
-    GRAB_KEYS.load(Ordering::Acquire) == keys_code(Some(CapsuleKeys::Suggest { rows: 0 }))
+    GRAB_KEYS.load(Ordering::Acquire)
+        == keys_code(Some(CapsuleKeys::Suggest {
+            rows: 0,
+            cycle: false,
+        }))
 }
 
 /// Hands `key` to the capsule if its keys include it; false otherwise.
@@ -2326,18 +2601,22 @@ pub fn capsule_key(key: CapsuleKey) -> bool {
 fn takes(keys: CapsuleKeys, key: &CapsuleKey) -> bool {
     match (keys, key) {
         (CapsuleKeys::Picker, CapsuleKey::Shortcut | CapsuleKey::Escape) => true,
-        (CapsuleKeys::Route { escape }, CapsuleKey::Escape) => escape,
-        (CapsuleKeys::Undo | CapsuleKeys::Suggest { .. }, CapsuleKey::Escape) => true,
         (
-            CapsuleKeys::Route { .. } | CapsuleKeys::List | CapsuleKeys::Suggest { .. },
+            CapsuleKeys::Route | CapsuleKeys::List | CapsuleKeys::Suggest { .. },
             CapsuleKey::OpenList,
         ) => true,
-        (CapsuleKeys::Suggest { rows }, CapsuleKey::Digit(digit)) => (1..=rows).contains(digit),
+        (CapsuleKeys::Suggest { rows, .. }, CapsuleKey::Digit(digit)) => (1..=rows).contains(digit),
+        (CapsuleKeys::Suggest { .. }, CapsuleKey::Press | CapsuleKey::Shift(_)) => true,
+        (
+            CapsuleKeys::Suggest { cycle: true, .. },
+            CapsuleKey::Return { shift: false } | CapsuleKey::Tab { .. },
+        ) => true,
         (CapsuleKeys::List, key) => !matches!(key, CapsuleKey::Shortcut),
         _ => false,
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// What the tap does with a key press while the list is open.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ListTap {
@@ -2348,6 +2627,7 @@ pub enum ListTap {
     Key(CapsuleKey),
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The list's reading of a key press, `typed` being what it types in the
 /// active layout.
 pub fn list_key(code: u16, flags: u64, typed: &str) -> ListTap {
@@ -2363,9 +2643,16 @@ pub fn list_key(code: u16, flags: u64, typed: &str) -> ListTap {
         36 | 76 => CapsuleKey::Return {
             shift: flags & SHIFT != 0,
         },
+        48 => CapsuleKey::Tab {
+            shift: flags & SHIFT != 0,
+        },
         126 => CapsuleKey::Up,
         125 => CapsuleKey::Down,
         51 => CapsuleKey::Backspace,
+        // Shift's digits type symbols, so the digit row reads by position.
+        _ if flags & (SHIFT | OPTION) == SHIFT && shifted_digit(code).is_some() => {
+            CapsuleKey::Digit(shifted_digit(code).unwrap_or(1))
+        }
         _ => match typed.chars().next() {
             Some(digit @ '1'..='9') if typed.len() == 1 && flags & OPTION == 0 => {
                 CapsuleKey::Digit(digit as u8 - b'0')
@@ -2377,6 +2664,16 @@ pub fn list_key(code: u16, flags: u64, typed: &str) -> ListTap {
     ListTap::Key(key)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// 1 to 9 for the ANSI digit row's key codes.
+fn shifted_digit(code: u16) -> Option<u8> {
+    [18, 19, 20, 21, 23, 22, 26, 28, 25]
+        .iter()
+        .position(|row| *row == code)
+        .map(|i| i as u8 + 1)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The ANSI Z key, when the layout has none.
 const KEY_Z: u16 = 6;
 
@@ -2477,14 +2774,80 @@ enum HandOff {
     Inspect,
 }
 
+/// Pastes or opens a written capture: its contact sheet and summary.
+#[cfg(target_os = "macos")]
+fn hand_off(how: HandOff, bundle: &Path) -> anyhow::Result<()> {
+    objc2::rc::autoreleasepool(|_| match how {
+        // ⌘V from Hex's keyboard layout snapshot, marked as Hex's: the
+        // crate's own reads TIS off the main thread.
+        HandOff::Paste => scrawl_capture::handoff::paste_bundle_with(bundle, &|| {
+            crate::keyboard::post_command('v').map_err(|error| anyhow::anyhow!("{error:#}"))
+        }),
+        HandOff::Inspect => inspect(bundle),
+    })
+}
+
+/// Linux pastes the summary through Hex's own paste path (Wayland or X11).
+#[cfg(target_os = "linux")]
+fn hand_off(how: HandOff, bundle: &Path) -> anyhow::Result<()> {
+    match how {
+        HandOff::Paste => {
+            let summary = summary(bundle)?;
+            with_linux_paster(|paster| paster.paste(&summary))
+        }
+        HandOff::Inspect => inspect(bundle),
+    }
+}
+
+fn inspect(bundle: &Path) -> anyhow::Result<()> {
+    scrawl_capture::handoff::load_bundle(bundle).and_then(|(dir, loaded)| {
+        scrawl_capture::handoff::open_path(&dir.join(loaded.contact_sheet))
+    })
+}
+
+/// A written capture's summary, as the clipboard carries it.
+#[cfg(target_os = "linux")]
+fn summary(bundle: &Path) -> anyhow::Result<String> {
+    let (dir, loaded) = scrawl_capture::handoff::load_bundle(bundle)?;
+    Ok(scrawl_capture::sketch::summary_markdown(&loaded, &dir))
+}
+
+/// The process's one paster for captures. On X11 it serves the clipboard
+/// for as long as it lives, so a copied capture stays pasteable.
+#[cfg(target_os = "linux")]
+fn with_linux_paster(
+    use_it: impl FnOnce(&mut crate::linux_paste::LinuxPaster) -> Result<()>,
+) -> anyhow::Result<()> {
+    static PASTER: Mutex<Option<crate::linux_paste::LinuxPaster>> = Mutex::new(None);
+    let mut paster = PASTER.lock().unwrap_or_else(|error| error.into_inner());
+    if paster.is_none() {
+        let shift = crate::app_settings::AppSettings::load()
+            .map(|settings| settings.paste_with_shift)
+            .unwrap_or(false);
+        *paster = Some(
+            crate::linux_paste::LinuxPaster::new(
+                Arc::default(),
+                Arc::new(AtomicBool::new(shift)),
+                Default::default(),
+            )
+            .map_err(|error| anyhow::anyhow!("{error:#}"))?,
+        );
+    }
+    use_it(paster.as_mut().expect("made above")).map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
 /// Copies a written capture to the clipboard, as Scrawl does: its summary,
 /// ready to paste into an agent.
 fn copy_to_clipboard(bundle: &Path) {
     if cfg!(test) {
         return;
     }
+    #[cfg(target_os = "macos")]
     let copied =
         objc2::rc::autoreleasepool(|_| scrawl_capture::handoff::copy_bundle_to_clipboard(bundle));
+    #[cfg(target_os = "linux")]
+    let copied =
+        summary(bundle).and_then(|summary| with_linux_paster(|paster| paster.copy(&summary)));
     if let Err(error) = copied {
         tracing::warn!(error = format!("{error:#}"), "could not copy the capture");
     }
@@ -2731,7 +3094,7 @@ fn duration_for(samples: usize) -> Duration {
 /// fresh transcription engine with the selected model, feeding `wavs` in
 /// place of the dictation timeline, and returns the finished bundle. Scrawl's
 /// engine records the screen meanwhile, which needs Screen Recording.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "macos"))]
 pub fn replay(wavs: &[PathBuf]) -> Result<PathBuf> {
     let mut samples = Vec::new();
     let mut sample_rate = None;
@@ -2793,7 +3156,7 @@ pub fn replay(wavs: &[PathBuf]) -> Result<PathBuf> {
     Err(eyre!("the capture never finished"))
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "macos"))]
 fn started_at(host: &CaptureHost) -> Result<u64> {
     host.active
         .as_ref()
@@ -2803,14 +3166,14 @@ fn started_at(host: &CaptureHost) -> Result<u64> {
 
 /// Recorded audio standing in for the dictation timeline: the whole file is
 /// delivered at once, stamped as if captured from the capture's start.
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "macos"))]
 struct WavTimeline {
     samples: Arc<Vec<f32>>,
     sample_rate: u32,
     feeder: Mutex<Option<(thread::JoinHandle<()>, CaptureInstant)>>,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_os = "macos"))]
 impl AudioTimeline for WavTimeline {
     fn open_sink(&self, sink: SyncSender<CaptureAudio>, since: CaptureInstant) -> Result<()> {
         let samples = self.samples.clone();
@@ -2885,6 +3248,7 @@ mod tests {
         let OwnWindows {
             excluded,
             passthrough,
+            ..
         } = own_windows_of(&roles);
         assert_eq!(excluded, [capsule, ink]);
         let engine_says_hex = |x, y| {
@@ -3160,7 +3524,6 @@ mod tests {
                 frames: Vec::new(),
                 video: None,
                 duration_ms,
-                video_offset_ms: 0,
             };
             let (_, bundle, _) = scrawl_capture::pipeline::finalize_capture_bundle_with_flags(
                 &self.dir,
@@ -3636,13 +3999,14 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_host_is_absent_while_captures_are_off() {
         // Captures are off by default, so no host, engine, thread, or sink
         // exists and the listener answers `feature-off`.
         assert!(!crate::app_settings::CaptureSettings::default().enabled);
         if !crate::app_settings::capture_on() {
-            assert!(CaptureHost::start(None).is_none());
+            assert!(CaptureHost::start(None, &Environment::for_test()).is_none());
         }
     }
 
@@ -3773,6 +4137,7 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(target_os = "macos")]
     /// Kit: Escape may be meant for the app being recorded, so it never
     /// ends a recording capture, and Hex's tap lets it through.
     #[test]
@@ -3870,6 +4235,54 @@ mod tests {
         assert!(!first.exists());
         assert!(lock(&host.outcomes).snapshot().last.is_none());
         host.shutdown(&audio);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_capture_stays_quiet_until_it_stops_is_cancelled_or_hex_quits() {
+        use crate::recording_environment::Effect::Mute;
+        use crate::recording_environment::observed::{
+            self,
+            Event::{Held, Restored},
+        };
+        let dir = temp_dir("quiet");
+        let audio = FakeTimeline::default();
+        let mut host = CaptureHost::with(
+            FakeEngine::new(Arc::new(FakeTranscriber)),
+            Some(dir.clone()),
+        )
+        .unwrap();
+        let (environment, events) = observed::controller();
+        host.environment = Some(environment.clone());
+        host.audio_behavior = Some(crate::app_settings::RecordingAudioBehavior::Mute);
+        let settled = || observed::settled(&environment, &events);
+
+        let start = |host: &mut CaptureHost| {
+            report(host.control(ScrawlCaptureAction::Start, &audio))
+                .bundle
+                .unwrap()
+        };
+        start(&mut host);
+        assert_eq!(settled(), [Held(Mute)]);
+        // A switch keeps output muted from one capture to the next.
+        let switch = CaptureCommand::Switch(CaptureTarget::Pointer);
+        let bundle = report(host.command(switch, &audio)).bundle.unwrap();
+        assert_eq!(settled(), []);
+        report(host.control(ScrawlCaptureAction::Stop, &audio));
+        assert_eq!(settled(), [Restored(Mute)]);
+        wait_for_last(&mut host, &audio, &bundle, true);
+
+        let bundle = start(&mut host);
+        assert_eq!(settled(), [Held(Mute)]);
+        report(host.control(ScrawlCaptureAction::Cancel, &audio));
+        assert_eq!(settled(), [Restored(Mute)]);
+        wait_for_last(&mut host, &audio, &bundle, true);
+
+        start(&mut host);
+        assert_eq!(settled(), [Held(Mute)]);
+        host.shutdown(&audio);
+        assert_eq!(settled(), [Restored(Mute)]);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -3980,10 +4393,10 @@ mod tests {
         .unwrap();
         let closed = CaptureCommand::Start(CaptureTarget::Window { id: 0 });
         let bundle = report(host.command(closed, &audio)).bundle.unwrap();
-        assert_eq!(
-            lock(&host.outcomes).snapshot().recording.unwrap().target,
-            TargetKind::Window
-        );
+        // The failed start can clear the recording before this reads it.
+        if let Some(recording) = lock(&host.outcomes).snapshot().recording {
+            assert_eq!(recording.target, TargetKind::Window);
+        }
         let last = wait_for_last(&mut host, &audio, &bundle, true);
         assert_eq!(last.stage, "failed");
         assert!(!bundle.exists());
@@ -4080,6 +4493,7 @@ mod tests {
         assert!(live.state().target.is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_shortcut_records_once_its_keys_come_up() {
         use crate::app_settings::{OPTION_KEY_MASK, SHIFT_KEY_MASK};
@@ -4194,9 +4608,8 @@ mod tests {
         drop(first);
         assert!(capsule_key(CapsuleKey::Escape));
 
-        // A routed capsule: the list shortcut opens the list; Escape only
-        // while a send can be undone.
-        second.set(CapsuleKeys::Route { escape: false });
+        // A routed capsule: the list shortcut opens the list; never Escape.
+        second.set(CapsuleKeys::Route);
         assert!(!picking() && !wants_escape() && list_key_wanted());
         assert!(!capsule_key(CapsuleKey::Shortcut));
         assert!(!capsule_key(CapsuleKey::Escape));
@@ -4205,18 +4618,32 @@ mod tests {
             !capsule_key(CapsuleKey::Press),
             "a press matters only to the list"
         );
-        second.set(CapsuleKeys::Route { escape: true });
-        assert!(wants_escape());
-        // A send from the list counting down: Escape, and ⌥⇧V goes to the app.
-        second.set(CapsuleKeys::Undo);
-        assert!(wants_escape() && !list_key_wanted() && !suggesting());
-        assert!(!capsule_key(CapsuleKey::OpenList));
-        // Suggestions: Escape, the list shortcut, and only their own digits.
-        second.set(CapsuleKeys::Suggest { rows: 2 });
-        assert!(suggesting() && wants_escape() && list_key_wanted() && !list_open());
+        second.set(CapsuleKeys::Route);
+        assert!(!wants_escape() && !capsule_key(CapsuleKey::Escape));
+        // Suggestions: the list shortcut and only their own digits, never
+        // Escape.
+        second.set(CapsuleKeys::Suggest {
+            rows: 2,
+            cycle: false,
+        });
+        assert!(suggesting() && !wants_escape() && list_key_wanted() && !list_open());
+        assert!(!capsule_key(CapsuleKey::Escape));
+        assert!(capsule_key(CapsuleKey::Press), "a press may fold them");
+        assert!(capsule_key(CapsuleKey::Shift(true)), "Shift shows the rule");
         assert!(capsule_key(CapsuleKey::Digit(2)));
         assert!(!capsule_key(CapsuleKey::Digit(3)), "no third row");
         assert!(!capsule_key(CapsuleKey::Text("h".into())));
+        assert!(!capsule_key(CapsuleKey::Tab { shift: false }));
+        assert!(!capsule_key(CapsuleKey::Return { shift: false }));
+        // The toast's one guess at a time: Return sends it, Tab moves on.
+        second.set(CapsuleKeys::Suggest {
+            rows: 2,
+            cycle: true,
+        });
+        assert!(suggesting());
+        assert!(capsule_key(CapsuleKey::Tab { shift: false }));
+        assert!(capsule_key(CapsuleKey::Return { shift: false }));
+        assert!(!capsule_key(CapsuleKey::Return { shift: true }));
         second.set(CapsuleKeys::List);
         assert!(!suggesting());
         assert!(list_open() && !wants_escape() && list_key_wanted());
@@ -4231,7 +4658,11 @@ mod tests {
                 (2, CapsuleKey::Shortcut),
                 (2, CapsuleKey::Escape),
                 (2, CapsuleKey::OpenList),
+                (2, CapsuleKey::Press),
+                (2, CapsuleKey::Shift(true)),
                 (2, CapsuleKey::Digit(2)),
+                (2, CapsuleKey::Tab { shift: false }),
+                (2, CapsuleKey::Return { shift: false }),
                 (2, CapsuleKey::Text("ho".into())),
                 (2, CapsuleKey::Press),
             ]
@@ -4251,15 +4682,18 @@ mod tests {
             list_key(76, shift, "\u{3}"),
             key(CapsuleKey::Return { shift: true })
         );
+        assert_eq!(list_key(48, 0, "\t"), key(CapsuleKey::Tab { shift: false }));
         assert_eq!(list_key(126, 0, ""), key(CapsuleKey::Up));
         assert_eq!(list_key(125, 0, ""), key(CapsuleKey::Down));
         assert_eq!(list_key(51, 0, "\u{7f}"), key(CapsuleKey::Backspace));
         assert_eq!(list_key(18, 0, "1"), key(CapsuleKey::Digit(1)));
+        // Shift's digits type symbols; the row reads by position.
+        assert_eq!(list_key(19, shift, "@"), key(CapsuleKey::Digit(2)));
+        assert_eq!(list_key(25, shift, "("), key(CapsuleKey::Digit(9)));
         assert_eq!(list_key(29, 0, "0"), key(CapsuleKey::Text("0".into())));
         assert_eq!(list_key(18, option, "¡"), key(CapsuleKey::Text("¡".into())));
         assert_eq!(list_key(4, shift, "H"), key(CapsuleKey::Text("H".into())));
         assert_eq!(list_key(123, 0, ""), ListTap::Swallow);
-        assert_eq!(list_key(48, 0, "\t"), ListTap::Swallow);
         assert_eq!(list_key(9, command, "v"), ListTap::Pass);
         assert_eq!(list_key(53, control, "\u{1b}"), ListTap::Pass);
     }
@@ -4371,10 +4805,10 @@ mod tests {
         assert!(feed.watchers.lock().unwrap().is_empty());
     }
 
-    fn words(times: &[(&str, i64, i64)]) -> Vec<TranscriptSegment> {
+    fn words(times: &[(&str, i64, i64)]) -> Vec<TimedWord> {
         times
             .iter()
-            .map(|&(text, start_ms, end_ms)| TranscriptSegment {
+            .map(|&(text, start_ms, end_ms)| TimedWord {
                 start_ms,
                 end_ms,
                 text: text.into(),

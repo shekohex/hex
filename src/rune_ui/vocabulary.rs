@@ -6,10 +6,10 @@ use rune::{El, TextEdit, edit_access, row};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, TextInput};
 
 use super::Ui;
-use super::controls::{Paint, note, section, setting_row};
+use super::controls::{METRICS, Paint, note, section, segmented, setting_row};
 use super::lists::{remove_button, small_button};
 use crate::desktop_i18n::tr;
-use crate::vocabulary::{self, VocabularyEntry};
+use crate::vocabulary::{self, VocabularyBoost, VocabularyEntry};
 
 static PLUS: &rune::Icon = &rune_theme_opencode::icons::PLUS;
 const TERM_WIDTH: f32 = 200.0;
@@ -106,7 +106,7 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
         "terms",
         tr("Names and terms"),
         Some(tr(
-            "Rewriting spells them right, and search finds them when misheard",
+            "Transcription and rewriting spell them right, and search finds them when misheard",
         )),
         actions,
     )];
@@ -117,7 +117,7 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
         rows.push(
             row()
                 .key(format!("term{index}"))
-                .px(12.0)
+                .px(METRICS.row_px)
                 .py(6.0)
                 .gap(8.0)
                 .center_y()
@@ -157,6 +157,26 @@ pub(super) fn section_view(ui: &Ui, p: Paint) -> El {
             p.danger(),
         ));
     }
+    rows.push(setting_row(
+        p,
+        "boost",
+        tr("Boost"),
+        Some(tr("How readily transcription swaps in a term")),
+        segmented(
+            p,
+            "vocabulary-boost",
+            &[tr("Off"), tr("Light"), tr("Normal"), tr("Strong")],
+            VocabularyBoost::ALL
+                .iter()
+                .position(|&boost| boost == ui.settings.vocabulary_boost)
+                .unwrap_or(2),
+            |ui: &mut Ui, index| {
+                if let Some(&boost) = VocabularyBoost::ALL.get(index) {
+                    ui.update(|settings| settings.vocabulary_boost = boost);
+                }
+            },
+        ),
+    ));
     section(p, "vocabulary", tr("Vocabulary"), rows)
 }
 

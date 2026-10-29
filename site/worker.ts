@@ -3,7 +3,7 @@
 // /hex/download/dev, the latest dev channel Mac download. Other hosts and
 // plain HTTP redirect to the canonical host. `cf dev` with ANY_HOST set turns
 // the redirect off for local testing.
-import { BASE_PATH, DEV_DOWNLOAD_PATH, FILES_PATH, stripBase, withBase } from "./src/base"
+import { BASE_PATH, DEV_DOWNLOAD_PATH, FILES_PATH, RELEASE_SERVICE, stripBase, withBase } from "./src/base"
 
 type Env = {
   ASSETS: { fetch(request: Request): Promise<Response> }
@@ -26,7 +26,7 @@ export default {
       return Response.redirect(url.toString(), 301)
     }
     if (url.pathname.startsWith(`${FILES_PATH}/`)) return file(request, env, decodeURIComponent(url.pathname.slice(FILES_PATH.length + 1)))
-    if (url.pathname === DEV_DOWNLOAD_PATH) return devDownload(request, env)
+    if (url.pathname === DEV_DOWNLOAD_PATH) return devDownload(request)
 
     // The route also matches paths like /hexagon, which are not ours.
     const path = stripBase(url.pathname)
@@ -58,15 +58,15 @@ function secure(headers: Headers) {
   headers.set("Referrer-Policy", "strict-origin-when-cross-origin")
 }
 
-// Redirects to the DMG of the release service's latest dev channel build on
-// this host, so one link always names the newest Mac dev build. The service
+// Redirects to the DMG of the release service's latest dev channel build, so
+// one link always names the newest Mac dev build on both site environments. The service
 // is another Worker on this zone; the compatibility flag
 // global_fetch_strictly_public lets this fetch reach it.
-async function devDownload(request: Request, env: Env): Promise<Response> {
+async function devDownload(request: Request): Promise<Response> {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, HEAD" } })
   }
-  const manifestUrl = `https://${env.CANONICAL_HOST}/release/hex/desktop/dev.json`
+  const manifestUrl = `${RELEASE_SERVICE}/hex/desktop/dev.json`
   const text = (body: string, status: number) => {
     const headers = new Headers({ "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" })
     secure(headers)

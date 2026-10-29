@@ -29,6 +29,7 @@ serde_json = "1.0.151"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+capture-core = { path = "../capture-core" }
 core-foundation = "0.10.0"
 core-graphics = "0.24.0"
 core-graphics-types = "0.1.3"
@@ -38,6 +39,12 @@ objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSPasteboardIt
 objc2-core-foundation = "0.3.2"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSString"] }
 screencapturekit = { version = "=11.0.0", features = ["macos_15_0"] }
+
+# The screen-cast portal over D-Bus; PipeWire and VA-API are loaded at run time.
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1", features = ["rt", "time"] }
+zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ab_glyph = "0.2.32"

@@ -9,7 +9,6 @@
   vulkan-loader,
   spirv-headers,
   openblas,
-  glib,
   alsa-lib,
   alsa-plugins,
   pipewire,
@@ -19,13 +18,17 @@
   fontconfig,
   freetype,
   curl,
+  ffmpeg,
+  gnutar,
+  openssh,
+  libva,
   wl-clipboard,
   wtype,
   grim,
   xclip,
   tesseract,
   nodejs,
-  wrapGAppsHook3,
+  makeWrapper,
   autoAddDriverRunpath,
   symlinkJoin,
   libx11,
@@ -49,6 +52,8 @@ let
       vulkan-loader
       openblas
       alsa-lib
+      pipewire
+      libva
       wayland
       libxkbcommon
       fontconfig
@@ -62,6 +67,9 @@ let
     };
   };
   runtimePackages = [
+    ffmpeg
+    gnutar
+    openssh
     curl
     wl-clipboard
     wtype
@@ -79,6 +87,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
+      ../.cargo
       ../build.rs
       ../crates
       ../src
@@ -89,9 +98,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../packaging
       ../gnome
       ../macos/HexMicrophoneDriver/Info.plist
-      ../sdk/commands/package.json
-      ../sdk/commands/src
-      ../sdk/commands/workspace-template
     ];
   };
 
@@ -99,7 +105,9 @@ rustPlatform.buildRustPackage (finalAttrs: {
     lockFile = ../Cargo.lock;
     outputHashes = {
       "transcribe-rs-0.3.11" = "sha256-MJJiug3LfbKsuHcL2+LJk95+j5kk/MWzb5ihdBlHLmE=";
-      "rune-0.0.1" = "sha256-6lblAy/T68iNlGAPPa6AKyCEBC8FgzYKeK7ElcBGhCc=";
+      "rune-0.0.1" = "sha256-wlqIPHX3DO8yRyqbm17IwoSQx5bnZ7xe9F+kvw+e+so=";
+      "procwatch-0.1.0" = "sha256-wlqIPHX3DO8yRyqbm17IwoSQx5bnZ7xe9F+kvw+e+so=";
+      "transcribe-cpp-sys-0.4.1" = "sha256-5pdsz6rY2iiHb9XWN6xM7OQ71lZtqmWcCb9U3c2x7aw=";
     };
   };
 
@@ -108,7 +116,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     cmake
     python3
     shaderc
-    wrapGAppsHook3
+    makeWrapper
     autoAddDriverRunpath
   ];
   buildInputs = [
@@ -116,7 +124,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
     vulkan-loader
     spirv-headers
     openblas
-    glib
     alsa-lib
     openssl
     libxkbcommon
@@ -137,10 +144,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
   env = buildEnv;
   # Desktop and installed-model tests are #[ignore]; run the remaining suite.
   doCheck = true;
-  # Upstream 00f670a adds Update channel but still asserts the macOS General
-  # fixture never scrolls (733 > 691, reproduced unchanged on upstream).
-  # Keep its assertion intact; exclude only this known non-Linux fixture.
-  checkFlags = [ "--skip=rune_ui::tests::panes::general_fits_the_default_window_and_hides_advanced_options" ];
   preCheck = ''
     export HOME="$TMPDIR/hex-test-home"
     mkdir -p "$HOME"
@@ -150,18 +153,16 @@ rustPlatform.buildRustPackage (finalAttrs: {
   postInstall = ''
     mkdir -p $out/share/gnome-shell/extensions/hex@shekohex.dev
     cp gnome/{metadata.json,interface.xml,extension.js} $out/share/gnome-shell/extensions/hex@shekohex.dev/
-    mv $out/bin/voice-control $out/bin/hex
     install -Dm644 ${../packaging/hex.desktop} $out/share/applications/hex.desktop
     substituteInPlace $out/share/applications/hex.desktop \
       --replace-fail '@HEX_BIN@' "$out/bin/hex"
   '';
 
-  preFixup = ''
-    gappsWrapperArgs+=(
-      --prefix PATH : ${lib.makeBinPath runtimePackages}
-      --prefix LD_LIBRARY_PATH : ${runtimeEnv.LD_LIBRARY_PATH}
+  postFixup = ''
+    wrapProgram $out/bin/hex \
+      --prefix PATH : ${lib.makeBinPath runtimePackages} \
+      --prefix LD_LIBRARY_PATH : ${runtimeEnv.LD_LIBRARY_PATH} \
       --set ALSA_PLUGIN_DIR ${runtimeEnv.ALSA_PLUGIN_DIR}
-    )
   '';
 
   passthru.devShell = mkShell {

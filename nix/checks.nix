@@ -77,11 +77,16 @@ in
         pkgs.vulkan-loader
         pkgs.wayland
         pkgs.libxkbcommon
+        pkgs.pipewire
+        pkgs.libva
       ];
     assert lib.all (package: builtins.elem (lib.getDev package) shell.nativeBuildInputs) [
       pkgs.curl
       pkgs.wl-clipboard
       pkgs.wtype
+      pkgs.ffmpeg
+      pkgs.gnutar
+      pkgs.openssh
     ];
     pkgs.runCommand "hex-shell-environment-check" { } ''
       test -d ${shell.ALSA_PLUGIN_DIR}

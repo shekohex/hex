@@ -13,7 +13,7 @@ use crate::linux_service::{Activation, Launch, Request};
 use crate::moonshine::Moonshine;
 
 #[derive(Parser)]
-#[command(version, about = "Local, observable voice recognition (Linux beta)")]
+#[command(version = crate::VERSION, about = "Local, observable voice recognition (Linux beta)")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -98,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: crate::experiments::ExperimentsCommand,
     },
+    /// Record, list, and send Scrawl captures (the `capture` experiment).
+    Capture {
+        #[command(subcommand)]
+        command: crate::control::cli::CaptureCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,7 +148,7 @@ enum ModelCommand {
     Status,
     /// Download and checksum-verify the default dictation model.
     Install,
-    /// List transcribe.cpp compute devices available to HEX.
+    /// List transcribe.cpp compute devices available to Hex.
     Devices,
     /// Load and prewarm the installed model.
     Check,
@@ -161,6 +166,9 @@ pub(crate) fn run(shutdown: &'static AtomicBool) -> Result<()> {
     // Like a read command: no log, lock, or running Hex.
     if let Command::Experiments { command } = &command {
         return crate::experiments::run(command);
+    }
+    if let Command::Capture { command } = command {
+        crate::control::cli::finish(crate::control::cli::capture(command));
     }
     let log_dir = crate::app_paths::init_process_logging(shutdown)?;
 
@@ -322,7 +330,9 @@ pub(crate) fn run(shutdown: &'static AtomicBool) -> Result<()> {
         Command::Settings { command } => {
             crate::control::cli::finish(crate::control::cli::settings(command))
         }
-        Command::Experiments { .. } => unreachable!("handled before logging"),
+        Command::Experiments { .. } | Command::Capture { .. } => {
+            unreachable!("handled before logging")
+        }
     })();
     match result {
         // A keybinding or script wants one line, not a report.
@@ -387,7 +397,7 @@ fn listen(event_path: &Path, device: Option<&str>, shutdown: &AtomicBool) -> Res
     let mut recognizer = Moonshine::load(Path::new(env!("CARGO_MANIFEST_DIR")))?;
     let input = match device {
         Some(name) => AudioInput::open_matching(name)?,
-        None => AudioInput::open(&[])?,
+        None => AudioInput::open_system_default()?,
     };
     let events = EventLog::create(event_path)?;
     events.emit(&VoiceEvent::SessionStarted {

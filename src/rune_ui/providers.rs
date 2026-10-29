@@ -623,7 +623,7 @@ pub(super) fn view(ui: &Ui, p: Paint) -> El {
 pub(super) fn poll(ui: &mut Ui) -> bool {
     let last = match &ui.service {
         super::Service::Live(backend) => match backend.as_ref() {
-            super::host::Backend::Host(host) => host.last_dictation(),
+            super::host::Backend::Host(host, _) => host.last_dictation(),
             super::host::Backend::Status(Some(status), _) => status.last_dictation.clone(),
             _ => None,
         },
@@ -700,7 +700,7 @@ pub(super) fn last_result(ui: &Ui, p: Paint) -> Option<El> {
                 ButtonKind::Secondary,
                 move |ui: &mut Ui, _| {
                     if let super::Service::Live(backend) = &ui.service
-                        && let super::host::Backend::Host(host) = backend.as_ref()
+                        && let super::host::Backend::Host(host, _) = backend.as_ref()
                     {
                         match host.provider_request(crate::linux_service::Request::RetryLast {
                             id,
@@ -729,7 +729,7 @@ pub(super) fn last_result(ui: &Ui, p: Paint) -> Option<El> {
             ButtonKind::Secondary,
             move |ui: &mut Ui, _| {
                 if let super::Service::Live(backend) = &ui.service
-                    && let super::host::Backend::Host(host) = backend.as_ref()
+                    && let super::host::Backend::Host(host, _) = backend.as_ref()
                     && let Err(error) =
                         host.provider_request(crate::linux_service::Request::ClearLast { id })
                 {

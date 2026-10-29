@@ -1,15 +1,15 @@
-//! The Scrawl pane (the `capture` experiment, in builds with the `capture`
-//! build option): captures inside Hex. The opt-in, the capture shortcut,
+//! The Scrawl pane (the `capture` experiment, macOS and Linux): captures
+//! inside Hex. The opt-in, the capture shortcut,
 //! the send-to list's shortcut, Screen Recording, the transcriber, the captures folder and how long
 //! captures are kept, and Scrawl's own app, which keeps the shortcut while
 //! it runs until "Use Hex for captures" asks it to quit.
 
-use rune::{El, col, row};
+use rune::{El, row};
 use scrawl_capture::retention::{Policy, Preset};
 
 use super::controls::{
-    ButtonKind, Choice, Paint, card, described_row, folding, note, section, segmented, select,
-    setting_row, toggle_row,
+    ButtonKind, Choice, Paint, card, described_row, folding, note, page, section, segmented,
+    select, setting_row, toggle_row,
 };
 use super::lists::{PermissionControl, permission_control};
 use super::platform::{PlatformRequest, ScrawlRequest, ScrawlView};
@@ -176,7 +176,9 @@ fn shortcut_rows(ui: &Ui, p: Paint, view: &ScrawlView) -> Vec<El> {
         Some((list_purpose.to_string(), p.muted())),
         shortcut_control(ui, p, ShortcutTarget::CaptureList),
     ));
-    if enabled {
+    // Linux asks through the desktop's screen-cast portal when a capture
+    // starts, and Wayland can't keep an overlay out of a recording.
+    if enabled && cfg!(target_os = "macos") {
         rows.push(setting_row(
             p,
             "screen-recording",
@@ -204,8 +206,27 @@ fn shortcut_rows(ui: &Ui, p: Paint, view: &ScrawlView) -> Vec<El> {
                 },
             ),
         ));
+        rows.push(recordings_row(ui, p));
     }
     rows
+}
+
+/// Lets screen recordings, captures included, show Hex's overlays, for
+/// showing someone how captures work.
+fn recordings_row(ui: &Ui, p: Paint) -> El {
+    toggle_row(
+        p,
+        "capture-show-in-recordings",
+        tr("Show in screen recordings"),
+        tr("Lets recordings, captures included, show Hex's capsule, ink, and HUD, for demos"),
+        ui.settings.capture.show_overlays_in_recordings,
+        |ui: &mut Ui| {
+            ui.update(|settings| {
+                settings.capture.show_overlays_in_recordings =
+                    !settings.capture.show_overlays_in_recordings;
+            });
+        },
+    )
 }
 
 fn transcriber_row(ui: &Ui, p: Paint) -> El {
@@ -239,6 +260,7 @@ fn storage_rows(ui: &Ui, p: Paint, view: &ScrawlView, layer: &mut Vec<El>) -> Ve
         .into_iter()
         .map(|preset| Choice {
             label: retention_label(preset.policy()),
+            detail: None,
             selected: preset.policy() == policy,
             choose: Box::new(move |ui: &mut Ui| {
                 ui.open = None;
@@ -249,6 +271,7 @@ fn storage_rows(ui: &Ui, p: Paint, view: &ScrawlView, layer: &mut Vec<El>) -> Ve
     if !choices.iter().any(|choice| choice.selected) {
         choices.push(Choice {
             label: retention_label(policy),
+            detail: None,
             selected: true,
             choose: Box::new(|ui: &mut Ui| ui.open = None),
         });
@@ -307,7 +330,7 @@ fn storage_rows(ui: &Ui, p: Paint, view: &ScrawlView, layer: &mut Vec<El>) -> Ve
 pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
     let view = ui.platform.scrawl.clone().unwrap_or_default();
     let enabled = ui.settings.capture.enabled;
-    let mut content = col().key("content").px(24.0).pt(4.0).gap(24.0);
+    let mut content = page("content");
     content = content.child(card(
         p,
         "enable",
@@ -342,13 +365,16 @@ pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         tr("Capture"),
         shortcut_rows(ui, p, &view),
     ));
-    if enabled {
+    // Apple's speech recognizer is macOS's; Linux transcribes with Hex's model.
+    if enabled && cfg!(target_os = "macos") {
         content = content.child(section(
             p,
             "transcription",
             tr("Transcription"),
             vec![transcriber_row(ui, p)],
         ));
+    }
+    if enabled {
         content = content.child(section(
             p,
             "storage",
@@ -363,6 +389,7 @@ pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn captures_default_off_and_refuse_a_shortcut_in_use() {
         let settings = AppSettings::default();
@@ -428,8 +455,10 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     const ALLOW: &str = "screen-recording-allow";
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn granted_screen_recording_shows_allowed_and_asks_nothing() {
         let mut rt = pane("mac-scrawl");
@@ -442,6 +471,7 @@ mod tests {
         assert!(asked(&rt).is_empty(), "Allowed is not a button");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn screen_recording_allow_opens_the_permission_guide() {
         let mut rt = pane("mac-scrawl-permission");

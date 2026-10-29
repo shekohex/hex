@@ -17,12 +17,9 @@ The window follows OpenCode Desktop's layout: a deep-background sidebar and a
 raised, rounded content panel. Hex keeps its own information, sections, and
 copy; the look comes from the kit.
 
-The macOS dictation HUD ([`dictation_indicator.rs`](../src/dictation_indicator.rs))
-is outside the system: its glossy Metal capsule is hand-tuned in HUD Lab. The
-Windows HUD draws the same capsule from a CPU port of its shader
-(`desktop_indicator_shader.rs`), and the Linux HUD
-([`linux_rune_hud.rs`](../src/linux_rune_hud.rs)) is a fixed dark pill in
-either appearance.
+The dictation HUD ([`rune_hud.rs`](../src/rune_hud.rs)) is outside the
+system: its glossy capsule and Dot scope are shaders (`rune_hud.wgsl`) drawn
+by a Rune overlay's compositor on every OS, hand-tuned in HUD Lab.
 
 ## Rules
 
@@ -69,7 +66,8 @@ These live in [`rune_ui/controls.rs`](../src/rune_ui/controls.rs) and
 
 | Job | Piece |
 |---|---|
-| Settings card, titled card | `card`, `section` |
+| Settings page (the gutter and the rhythm between sections) | `page` (cards hang `row_px` past the gutter so row text sits on the title's edge) or `bare_page` (free-standing content on the gutter); their numbers are `METRICS`, the one set of layout tokens |
+| Settings card, titled card, a card whose label line carries a control | `card`, `section`, `section_with` (Advanced, a status, an add button) |
 | Settings row (title, description, control) | `setting_row`, `described_row`, `link_row` (a one-line link under the title, at the plain row height), `toggle_row`; a row that toggles shows `row_switch`; any other row pressed as a whole: `pressable_row` |
 | A few exclusive choices / a dropdown | `segmented`, `select` |
 | A value whose choices open in a sheet, not a menu | `sheet_button` (the value and a trailing chevron) |
@@ -80,7 +78,8 @@ These live in [`rune_ui/controls.rs`](../src/rune_ui/controls.rs) and
 | Short message under a control | `note` |
 | Text entry saved when typing pauses | `text_field` |
 | Keyboard highlight in a search popover | `Highlight` |
-| List + detail | `split` with `list_row`, `group_label`, `detail_header`, `detail_title`, `section_label`, `fact` |
+| List + detail (Commands, Meetings, History) | `list_detail`: `list_column` (search over the rows, on the title's edge, no divider) and `item` rows (no hover fill, time on the right, a hover action in its place via `row_action`), grouped by `group`; the selected item in `body`'s raised card with `card_header`, `card_title`, `meta_text`, `ghost_icon` actions, `card_scroll`, and `facts`; `empty_state` for nothing to show |
+| List + detail (Activity) | `split` with `list_row`, `group_label`, `detail_header`, `detail_title`, `section_label`, `fact` |
 | Keyboard-selectable list (sidebar, list + detail, picker languages) | `source_list` around rows made with `list_row` or `source_item` |
 | Nothing to show, errors | `message`, `placeholder`, `error_panel` |
 | A permission's Allow / Allowed control | `permission_control`, `allowed` |
@@ -99,9 +98,8 @@ missing capability omits the row instead of imitating it.
 - Sentence case for every label, button, title, and section label:
   "Open settings", "Stop & transcribe", "Permissions needed". Proper nouns keep
   their capitals: Hex, OpenCode, Apple Intelligence, Finder, Zoom.
-- One product name: "Hex". Never "HEX" in UI strings, window titles, or menus.
-  File and artifact names (`HEX.app`, `HEX-<version>…`) and `HEX_*` environment
-  variables are identifiers, not copy.
+- One product name: "Hex", in copy, comments, and docs alike. `HEX_*`
+  environment variables are identifiers, not copy.
 - Use "…" (one character) for ellipses, for both progress ("Saving…") and for
   buttons that open a further choice ("Choose a file…").
 - Row descriptions are one phrase with no closing period ("Hold to dictate,
@@ -125,13 +123,19 @@ cargo run -- app -- --list-scenes
 cargo run -- app -- --snap /tmp/hex-modes.png --scene modes
 cargo run -- app -- --snap /tmp/hex-modes-light.png --scene modes --theme light
 cargo run -- app -- --snap /tmp/hex-mac-settings.png --scene mac-settings
+# Both themes of several scenes into one folder:
+OUT=/tmp/hex-snaps scripts/snap-set.sh modes mac-settings
 # Goldens (light and dark) and pane behavior:
-cargo test --bin voice-control rune_ui
+scripts/check rune_ui
+# After an intended visual change, rewrite the goldens (Linux only):
+HEX_UPDATE_GOLDENS=1 cargo test --locked --bin hex rune_ui
 ```
 
 On a machine without a GPU, render on lavapipe with
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`. Goldens live in
-`tests/golden/` and are compared within a small per-pixel tolerance; rewrite
-them only for an intended visual change. A scene is a fixture, not native
-end-to-end proof: the real window, overlays, and input still need a person on
-each OS.
+`tests/golden/` and are compared within a small per-pixel tolerance. The golden
+tests run only on Linux; from a Mac, dispatch `check-linux.yml` on the branch
+and take its `golden-actual` artifact. Look at every changed image and commit
+it with the change that caused it. A scene is a fixture, not native end-to-end
+proof: the meeting capsules and the HUD have no scene, and the real window,
+overlays, and input still need a person on each OS.

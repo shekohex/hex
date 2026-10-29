@@ -52,7 +52,7 @@ result wait; they contain durations/counts, never audio, context, keys, or trans
 text. Batch recovery logs the original failed attempt before replacing its error.
 Escape cancellation and listener shutdown have separate diagnostic records.
 
-The click-through Rune/GNOME recording HUD shows the latest 120 characters of provisional
+The click-through GNOME HUD or shared Rune live-text plate shows the latest 120 characters of provisional
 realtime text, including append-only deltas and replaceable Parakeet snapshots.
 Finals replace drafts; completion order does not change transcript order. Drafts
 never enter cleanup or paste. A new capture replaces the preview owner; hiding
@@ -278,7 +278,8 @@ API references: [Mutter accelerators](https://gnome.pages.gitlab.gnome.org/mutte
 ## Upgrade compatibility
 
 The old branch `feat/linux-cloud-pipelines` at `557595a` remains reference-only.
-`feat/linux-cloud-latest` starts at upstream `dev` / fork `main` (`00f670a`).
+`feat/linux-cloud-latest` started at `00f670a` and now merges fork `main`
+`385bb16`.
 Shared `settings.json`, Rune UI, local streaming engine, portal/CLI shortcuts,
 Voice Action, transformations, and retained History remain upstream-owned.
 Provider processing modes replace their own Global mode, without layering.
@@ -299,9 +300,9 @@ RAM limits and retry identity. Rune provider-editor tests cover round trips and
 invalid drafts. These are not physical microphone, live provider, clipboard target,
 or GNOME-session proof. Observed verification belongs in the upgrade report.
 
-## Known upstream verification defects
+## Previous upstream verification defects
 
-Pristine upstream `00f670a` reproduces `general_fits_the_default_window_and_hides_advanced_options` failing with `General scrolls: 733 > 691` after the new Update channel row. The original assertion remains unchanged. Linux Nix packaging excludes only this proven macOS-fixture failure; the normal check script still reports it.
+The original upgrade baseline `00f670a` reproduces `general_fits_the_default_window_and_hides_advanced_options` failing with `General scrolls: 733 > 691` after the new Update channel row. Later upstream moved the Update channel row into Advanced, then replaced the old no-scroll test during its layout redesign. The fork no longer carries a Nix test exclusion.
 
 Pristine upstream also fails `platform_goldens` and `experiment_goldens`: `mac-settings-dark`, `mac-settings-sides-dark`, and `shortcut-explainer-toggle-{dark,light}`. Their images remain unchanged. Linux/provider goldens intentionally changed with the provider controls; this does not establish native macOS behavior.
 
@@ -315,3 +316,31 @@ Accepted output keeps Escape registered on X11 and portal backends, not only
 GNOME. The input reducer stays idle/idempotent; the dispatcher routes that
 explicit cancellation to the newest unfinished output. Explicit retry also
 resets local textarea edits without changing the retained raw transcript.
+
+## Latest-main integration (October 29, 2026)
+
+Upstream Wayland paste now waits for shortcut modifiers to settle and chooses
+`wtype` only when the compositor advertises virtual keyboards; otherwise it uses
+the RemoteDesktop portal. Cloud jobs use that same paster. Portal approval remains
+cancellable until actual insertion is committed. GNOME retains its existing
+extension-based shortcut/context/paste/HUD adapter, including its physical
+modifier check, because the portal does not replace focused-window capture.
+
+Rune's shared GPU HUD replaces the fork's separate recording pill. Cloud drafts
+publish through its adjacent live-text plate without requiring the local
+`live-text` experiment. Generation fences, 120-character bounds, and clearing on
+idle/shutdown remain; GNOME still receives its original preview API.
+
+Upstream microphone routing/backoff and capture-idle guards are retained. The
+fork's cancelled-cold-open serialization and no-audio watchdog remain because
+upstream closing still abandons an in-flight open. The fork's owned MPRIS pause
+still precedes a Bluetooth cold open and lasts through pending provider output;
+upstream's double-tap mute grace is adopted but does not replace track/process
+ownership checks. The Speech model Language row shows the cloud language without opening the local
+model selector; edit it in Cloud providers. Linux Modes remain visible, including final transformations,
+without the new upstream `modes` experiment requirement.
+
+Linux keeps `voice-control` as its existing data directory (including Home
+Manager's service environment and CLI discovery), rather than orphaning provider
+settings after upstream's rename to `hex`. Legacy settings migration and editable
+first-run seeds remain supported. Other operating systems follow upstream paths.
