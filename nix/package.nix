@@ -152,7 +152,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   postInstall = ''
     mkdir -p $out/share/gnome-shell/extensions/hex@shekohex.dev
-    cp gnome/{metadata.json,interface.xml,extension.js} $out/share/gnome-shell/extensions/hex@shekohex.dev/
+    cp gnome/{metadata.json,interface.xml,extension.js,hud.js} $out/share/gnome-shell/extensions/hex@shekohex.dev/
     install -Dm644 ${../packaging/hex.desktop} $out/share/applications/hex.desktop
     substituteInPlace $out/share/applications/hex.desktop \
       --replace-fail '@HEX_BIN@' "$out/bin/hex"

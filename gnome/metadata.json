@@ -3,6 +3,6 @@
   "name": "HEX",
   "description": "Native GNOME integration for HEX dictation: shortcut, paste, window context and recording indicator.",
   "shell-version": ["49", "50"],
-  "version": 2,
+  "version": 3,
   "url": "https://github.com/shekohex/hex"
 }

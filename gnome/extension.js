@@ -7,6 +7,7 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {CaptionHud} from './hud.js';
 
 const BUS = 'dev.hex.Gnome';
 const PATH = '/dev/hex/Gnome';
@@ -23,6 +24,9 @@ export default class HexExtension extends Extension {
             this._bus = Gio.bus_own_name_on_connection(Gio.DBus.session, BUS,
                 Gio.BusNameOwnerFlags.NONE, null, null);
             this._nextLease = 0;
+            this._state = 0;
+            this._hudPosition = 0;
+            this._transcript = '';
             this._signals = [];
             this._extraShortcuts = new Map();
             this._signals.push(global.display.connect('accelerator-activated', (_display, action) => {
@@ -45,11 +49,8 @@ export default class HexExtension extends Extension {
                     this._showState(0);
                 }
             });
-            this._label = new St.Label({
-                reactive: false, can_focus: false, visible: false,
-                style: 'background-color: #171717; color: #eeeeee; border: 1px solid #292929; border-radius: 18px; padding: 9px 18px; font-size: 13px;',
-            });
-            Main.layoutManager.addChrome(this._label);
+            this._hud = new CaptionHud();
+            Main.layoutManager.addChrome(this._hud.actor);
         } catch (error) {
             this.disable();
             throw error;
@@ -64,8 +65,8 @@ export default class HexExtension extends Extension {
         if (this._modeSignal)
             Main.sessionMode.disconnect(this._modeSignal);
         this._modeSignal = 0;
-        this._label?.destroy();
-        this._label = null;
+        this._hud?.destroy();
+        this._hud = null;
         this._object?.unexport();
         this._object = null;
         if (this._bus)
@@ -122,8 +123,7 @@ export default class HexExtension extends Extension {
         this._state = 0;
         this._hudPosition = 0;
         this._transcript = '';
-        if (this._label) this._label.text = '';
-        this._label?.hide();
+        this._hud?.hide();
         if (this._watch)
             Gio.bus_unwatch_name(this._watch);
         this._watch = 0;
@@ -182,25 +182,14 @@ export default class HexExtension extends Extension {
         this._state = state;
         if (!state) {
             this._transcript = '';
-            this._label.text = '';
-            this._label.hide();
+            this._hud.hide();
             this._ungrab(this._escape);
             this._escape = 0;
             return;
         }
         if (!this._escape)
             this._escape = this._grab('Escape');
-        if (this._hudPosition === 2) { this._label.hide(); return; }
-        const title = state === 1 ? 'Recording' : 'Transcribing';
-        this._label.text = this._transcript ? `${title}\n${this._transcript}` : title;
-        const monitor = Main.layoutManager.primaryMonitor;
-        if (monitor) {
-            this._label.show();
-            const [, width] = this._label.get_preferred_width(-1);
-            const [, height] = this._label.get_preferred_height(width);
-            const y = this._hudPosition === 1 ? monitor.y + monitor.height - height - 16 : monitor.y + 16;
-            this._label.set_position(monitor.x + Math.round((monitor.width - width) / 2), y);
-        }
+        this._hud.show(state, this._transcript, this._hudPosition);
     }
 
     SetHudAsync([lease, position], invocation) {

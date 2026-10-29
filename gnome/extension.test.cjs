@@ -38,7 +38,7 @@ function fixture({enable = true} = {}) {
         get_monitor_scale: () => 1,
     };
     const Main = {
-        wm: {allowKeybinding() {}}, overview: {visible: false}, modalCount: 0,
+        panel: {height: 32}, wm: {allowKeybinding() {}}, overview: {visible: false}, modalCount: 0,
         sessionMode: {isLocked: false, isGreeter: false, connect: (_name, callback) => {
             state.modeCallback = callback; return 1;
         }, disconnect() {}},
@@ -52,10 +52,45 @@ function fixture({enable = true} = {}) {
             if (state.chromeError) throw new Error(state.chromeError);
         }},
     };
+    const timers = new Map();
+    let nextTimer = 1;
+    state.now = 1000000;
+    class Actor {
+        constructor(options = {}) {
+            Object.assign(this, {width: 0, height: 0, x: 0, y: 0, opacity: 255,
+                translation_y: 0, visible: true, children: [], ...options});
+            this.clutter_text = {
+                set_line_wrap(value) {assert.equal(value, true);},
+                set_line_wrap_mode() {}, set_ellipsize() {},
+                set_use_markup(value) {assert.equal(value, false);},
+                set_attributes: attributes => {this.attributes = attributes;},
+                get_layout: () => {
+                    const text = this.text ?? '';
+                    const columns = Math.max(1, Math.floor(this.width / 8));
+                    const characters = Array.from(text);
+                    const starts = [];
+                    for (let index = 0; index < Math.max(1, characters.length); index += columns)
+                        starts.push(new TextEncoder().encode(characters.slice(0, index).join('')).length);
+                    return {set_width() {}, get_lines_readonly: () => starts.map(index => ({get_start_index: () => index})),
+                        index_to_pos: index => ({y: starts.indexOf(index) * 20 * 1024}),
+                        get_pixel_size: () => [this.width, starts.length * 20]};
+                },
+            };
+        }
+        show() {this.visible = true;}
+        hide() {this.visible = false;}
+        destroy() {this.destroyed = true; this.children.forEach(child => child.destroy());}
+        add_child(child) {this.children.push(child);}
+        set_position(x, y) {this.x = x; this.y = y; state.position = [x, y];}
+        set_width(width) {this.width = width;}
+        set_height(height) {this.height = height;}
+        remove_all_transitions() {}
+        ease({duration, mode, ...values}) {this.lastAnimation = {duration, mode, ...values}; Object.assign(this, values);}
+    }
     const context = {
         TextEncoder, TextDecoder, Extension: class {path = __dirname;}, Main,
         Clutter: {ModifierType: {SHIFT_MASK: 1, CONTROL_MASK: 4, MOD1_MASK: 8, SUPER_MASK: 64},
-            InputDeviceType: {KEYBOARD_DEVICE: 1}, KeyState: {PRESSED: 1, RELEASED: 0},
+            AnimationMode: {EASE_OUT_CUBIC: 1}, InputDeviceType: {KEYBOARD_DEVICE: 1}, KeyState: {PRESSED: 1, RELEASED: 0},
             KEY_Control_L: 1, KEY_Shift_L: 2, KEY_v: 3},
         Meta: {KeyBindingFlags: {IGNORE_AUTOREPEAT: 16, TRIGGER_RELEASE: 128}, KeyBindingAction: {NONE: 0},
             external_binding_name_for_action: id => String(id)},
@@ -83,19 +118,34 @@ function fixture({enable = true} = {}) {
             Variant: class {constructor(signature, values) {this.signature = signature; this.values = values;}},
             file_get_contents: () => [true, fs.readFileSync(`${__dirname}/interface.xml`)],
             PRIORITY_DEFAULT: 0, SOURCE_REMOVE: false,
-            timeout_add: (_priority, _time, callback) => setImmediate(callback),
-            get_monotonic_time: () => 1000000,
+            SOURCE_CONTINUE: true,
+            timeout_add: (_priority, delay, callback) => {
+                const id = nextTimer++;
+                timers.set(id, callback);
+                const tick = () => {
+                    if (!timers.has(id)) return;
+                    state.now += delay * 1000;
+                    if (callback()) setImmediate(tick);
+                    else timers.delete(id);
+                };
+                setImmediate(tick);
+                return id;
+            },
+            source_remove: id => timers.delete(id),
+            get_monotonic_time: () => state.now,
         },
         St: {
-            Label: class {
-                constructor(options) {assert.equal(options.reactive, false); assert.equal(options.can_focus, false); this.visible = false;}
-                show() {this.visible = true;} hide() {this.visible = false;} destroy() {this.destroyed = true;}
-                get_preferred_width() {return [100, 100];} get_preferred_height() {return [50, 50];} set_position(x, y) {state.position = [x, y];}
-            },
+            Widget: Actor, Label: Actor,
+            Settings: {get: () => ({enable_animations: state.animations !== false})},
+            ThemeContext: {get_for_stage: () => ({scale_factor: state.scale ?? 1})},
             ClipboardType: {CLIPBOARD: 1}, Clipboard: {get_default: () => ({
                 set_text: (_selection, text) => {state.clipboard = text;},
                 get_text: (_selection, callback) => setImmediate(() => callback(null, state.clipboard)),
             })},
+        },
+        Pango: {SCALE: 1024, WrapMode: {WORD_CHAR: 1}, EllipsizeMode: {NONE: 0},
+            AttrList: class {attributes = []; insert(attribute) {this.attributes.push(attribute);}},
+            attr_foreground_alpha_new: alpha => ({alpha}),
         },
         GdkPixbuf: {InterpType: {BILINEAR: 1}, PixbufLoader: class {
             write() {} close() {} get_pixbuf() {return {width: 100, height: 80,
@@ -110,6 +160,10 @@ function fixture({enable = true} = {}) {
             })})}),
         }}},
     };
+    const hudSource = fs.readFileSync(`${__dirname}/hud.js`, 'utf8')
+        .replace(/^import .*;\n/gm, '')
+        .replace('export class CaptionHud', 'globalThis.CaptionHud = class CaptionHud');
+    vm.runInNewContext(hudSource, context);
     vm.runInNewContext(source, context);
     const extension = new context.HexExtension();
     if (enable) extension.enable();
@@ -120,7 +174,7 @@ function fixture({enable = true} = {}) {
             return_dbus_error: (_name, message) => reject(new Error(message)),
         }));
     }
-    return {extension, call, state, display, Main, keys, signals, grabs, watches, emitted};
+    return {extension, call, state, display, Main, keys, signals, grabs, watches, emitted, timers};
 }
 
 test('failed GNOME HUD startup releases partial initialization', () => {
@@ -205,20 +259,21 @@ test('live HUD replaces drafts, stays focus-free, clears on hide and rejects sta
     const [lease] = await f.call('Acquire', ['<Control>space']);
     await f.call('SetState', [lease, 1]);
     await f.call('SetTranscript', [lease, 'Draft']);
-    assert.equal(f.state.label.text, 'Recording\nDraft');
+    assert.equal(f.extension._hud._caption.text, 'Draft');
     await f.call('SetTranscript', [lease, 'Revised <draft>']);
-    assert.equal(f.state.label.text, 'Recording\nRevised <draft>');
+    assert.equal(f.extension._hud._caption.text, 'Revised <draft>');
     await f.call('SetState', [lease, 2]);
-    assert.equal(f.state.label.text, 'Transcribing\nRevised <draft>');
+    assert.equal(f.extension._hud._status.text, '◌  Transcribing');
+    assert.equal(f.extension._hud._caption.text, 'Revised <draft>');
     await assert.rejects(f.call('SetTranscript', [lease, 'x'.repeat(513)]), /limit/);
     await assert.rejects(f.call('SetTranscript', [lease, 'other'], ':other'), /expired/);
     await f.call('SetState', [lease, 0]);
     await f.call('SetTranscript', [lease, 'late']);
     await f.call('SetState', [lease, 1]);
-    assert.equal(f.state.label.text, 'Recording');
+    assert.equal(f.extension._hud._caption.text, '');
     f.Main.sessionMode.isLocked = true;
     f.state.modeCallback();
-    assert.equal(f.state.label.text, '');
+    assert.equal(f.extension._hud._caption.text, '');
     assert.equal(f.state.label.visible, false);
     await assert.rejects(f.call('SetTranscript', [lease, 'private']), /locked/);
     f.extension.disable();
@@ -250,6 +305,52 @@ test('GNOME hidden HUD keeps Escape available and bottom placement follows setti
     assert.ok(f.extension._escape);
     await f.call('SetHud', [lease, 1]);
     assert.equal(f.state.label.visible, true);
-    assert.deepEqual(f.state.position, [450, 934]);
+    assert.deepEqual([f.state.label.x, f.state.label.y], [290, 950]);
+    f.extension.disable();
+});
+
+
+test('captions keep fixed notch width, grow to two rows, scroll old text upward and animate words', async () => {
+    const f = fixture(); const [lease] = await f.call('Acquire', ['<Control>space']);
+    await f.call('SetState', [lease, 1]);
+    const hud = f.extension._hud;
+    const compact = hud.actor.height;
+    assert.equal(hud.actor.width, 420);
+    await f.call('SetTranscript', [lease, 'One short sentence']);
+    const firstRow = hud.actor.height;
+    assert.ok(firstRow > compact);
+    await f.call('SetTranscript', [lease, 'One short sentence '.repeat(12)]);
+    assert.equal(hud.actor.width, 420);
+    assert.equal(hud._viewport.height, 40);
+    assert.ok(hud.actor.height > firstRow);
+    assert.ok(hud._caption.translation_y < 0, 'older lines scroll above clipped viewport');
+    assert.equal(hud._caption.lastAnimation.duration, 180);
+    assert.ok(hud._caption.attributes.attributes.some(attribute => attribute.alpha < 65535));
+    assert.equal(hud.actor.reactive, false);
+    assert.equal(hud._viewport.reactive, false);
+    await f.call('SetHud', [lease, 1]);
+    assert.equal(hud.actor.y + hud.actor.height, 984, 'bottom stays anchored while expanding');
+    await f.call('SetState', [lease, 0]);
+    assert.equal(f.timers.size, 0, 'hide cancels caption animation sources');
+    assert.equal(hud._caption.text, '');
+    f.extension.disable();
+});
+
+test('captions handle multi-byte replacements, narrow monitors and reduced motion without timers', async () => {
+    const f = fixture(); f.state.animations = false;
+    f.Main.layoutManager.primaryMonitor.width = 300;
+    const [lease] = await f.call('Acquire', ['<Control>space']);
+    await f.call('SetState', [lease, 1]);
+    await f.call('SetTranscript', [lease, 'مرحبا بالعالم 漢字 '.repeat(6)]);
+    const hud = f.extension._hud;
+    assert.equal(hud.actor.width, 268);
+    assert.ok(hud._viewport.height <= 40);
+    assert.equal(f.timers.size, 0);
+    await f.call('SetTranscript', [lease, '<revised>']);
+    assert.equal(hud._caption.text, '<revised>', 'replacement is plain text, never markup');
+    assert.equal(Math.abs(hud._caption.translation_y), 0);
+    await f.call('Release', [lease]);
+    assert.equal(hud.actor.visible, false);
+    assert.equal(hud._caption.text, '');
     f.extension.disable();
 });

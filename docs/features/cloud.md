@@ -52,8 +52,14 @@ result wait; they contain durations/counts, never audio, context, keys, or trans
 text. Batch recovery logs the original failed attempt before replacing its error.
 Escape cancellation and listener shutdown have separate diagnostic records.
 
-The click-through GNOME HUD or shared Rune live-text plate shows the latest 120 characters of provisional
-realtime text, including append-only deltas and replaceable Parakeet snapshots.
+The click-through GNOME HUD or shared Rune live-text plate shows a UTF-8-safe
+512-byte tail of provisional realtime text, including append-only deltas and
+replaceable Parakeet snapshots. GNOME uses a fixed 420 logical-pixel notch
+(clamped on narrow displays), expanding vertically to at most two caption lines.
+New words fade in, older rows scroll upward and dim; reduced motion disables
+transitions. The shared Rune plate remains upstream’s single-line implementation.
+Compositor mocks cover sizing, scroll/fade requests, Unicode, reduced motion,
+and cleanup. Native visual verification is left to the user.
 Finals replace drafts; completion order does not change transcript order. Drafts
 never enter cleanup or paste. A new capture replaces the preview owner; hiding
 clears it. GNOME requires the updated HEX extension to load (log out/in if needed);
@@ -328,7 +334,7 @@ modifier check, because the portal does not replace focused-window capture.
 
 Rune's shared GPU HUD replaces the fork's separate recording pill. Cloud drafts
 publish through its adjacent live-text plate without requiring the local
-`live-text` experiment. Generation fences, 120-character bounds, and clearing on
+`live-text` experiment. Generation fences, 512-byte bounds, and clearing on
 idle/shutdown remain; GNOME still receives its original preview API.
 
 Upstream microphone routing/backoff and capture-idle guards are retained. The

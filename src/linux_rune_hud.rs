@@ -176,12 +176,12 @@ impl Preview {
         if preview.generation != self.0 {
             return;
         }
-        // Keep the most recent 120 characters, matching the GNOME preview.
-        let start = text
-            .char_indices()
-            .rev()
-            .nth(119)
-            .map_or(0, |(offset, _)| offset);
+        // Keep enough wrapping context for two caption rows, within the
+        // existing GNOME wire limit even for multi-byte scripts.
+        let mut start = text.len().saturating_sub(512);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
         preview.text = text[start..]
             .chars()
             .map(|character| {
@@ -227,12 +227,12 @@ mod preview_tests {
         let older = Preview::acquire();
         older.update("old");
         let newer = Preview::acquire();
-        newer.update(&"界".repeat(150));
+        newer.update(&"界".repeat(300));
         older.update("stale");
-        assert_eq!(live_transcript(), "界".repeat(120));
+        assert_eq!(live_transcript(), "界".repeat(170));
         assert_eq!(
             changes.lock().unwrap().last(),
-            Some(&Some("界".repeat(120)))
+            Some(&Some("界".repeat(170)))
         );
         clear_preview();
         newer.update("late final");
