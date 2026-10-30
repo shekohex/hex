@@ -124,6 +124,9 @@ export class CaptionHud {
         const paint = () => {
             const elapsed = animate ? (GLib.get_monotonic_time() - started) / 1000 : FADE_MS + 160;
             const attributes = new Pango.AttrList();
+            // Clutter's alpha attributes need an explicit Pango foreground;
+            // the label's CSS color alone can render these runs as black.
+            attributes.insert(Pango.attr_foreground_new(0xf4f4, 0xf4f4, 0xf5f5));
             if (olderEnd) {
                 const older = Pango.attr_foreground_alpha_new(40000);
                 older.start_index = 0; older.end_index = olderEnd;

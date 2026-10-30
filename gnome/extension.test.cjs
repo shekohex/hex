@@ -146,6 +146,7 @@ function fixture({enable = true} = {}) {
         Pango: {SCALE: 1024, WrapMode: {WORD_CHAR: 1}, EllipsizeMode: {NONE: 0},
             AttrList: class {attributes = []; insert(attribute) {this.attributes.push(attribute);}},
             attr_foreground_alpha_new: alpha => ({alpha}),
+            attr_foreground_new: (red, green, blue) => ({foreground: [red, green, blue]}),
         },
         GdkPixbuf: {InterpType: {BILINEAR: 1}, PixbufLoader: class {
             write() {} close() {} get_pixbuf() {return {width: 100, height: 80,
@@ -352,5 +353,27 @@ test('captions handle multi-byte replacements, narrow monitors and reduced motio
     await f.call('Release', [lease]);
     assert.equal(hud.actor.visible, false);
     assert.equal(hud._caption.text, '');
+    f.extension.disable();
+});
+
+test('caption alpha runs retain an explicit light foreground throughout fades and replacements', async () => {
+    const f = fixture(); const [lease] = await f.call('Acquire', ['<Control>space']);
+    await f.call('SetState', [lease, 1]);
+    const assertForeground = () => {
+        const attributes = f.extension._hud._caption.attributes.attributes;
+        const foreground = attributes.find(attribute => attribute.foreground);
+        assert.deepEqual(Array.from(foreground.foreground), [0xf4f4, 0xf4f4, 0xf5f5]);
+        assert.equal(foreground.start_index, undefined, 'foreground covers the entire text by default');
+        assert.equal(foreground.end_index, undefined);
+    };
+    await f.call('SetTranscript', [lease, 'Caption words '.repeat(12)]);
+    assertForeground();
+    while (f.timers.size) {
+        await new Promise(resolve => setImmediate(resolve));
+        assertForeground();
+    }
+    f.state.animations = false;
+    await f.call('SetTranscript', [lease, 'نص جديد']);
+    assertForeground();
     f.extension.disable();
 });

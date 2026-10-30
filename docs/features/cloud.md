@@ -57,9 +57,10 @@ The click-through GNOME HUD or shared Rune live-text plate shows a UTF-8-safe
 replaceable Parakeet snapshots. GNOME uses a fixed 420 logical-pixel notch
 (clamped on narrow displays), expanding vertically to at most two caption lines.
 New words fade in, older rows scroll upward and dim; reduced motion disables
-transitions. The shared Rune plate remains upstream’s single-line implementation.
+transitions. Caption fade attributes explicitly retain a light foreground on the
+dark background, independent of the Shell theme. The shared Rune plate remains upstream’s single-line implementation.
 Compositor mocks cover sizing, scroll/fade requests, Unicode, reduced motion,
-and cleanup. Native visual verification is left to the user.
+foreground through fades/replacements, and cleanup. Native visual verification is left to the user.
 Finals replace drafts; completion order does not change transcript order. Drafts
 never enter cleanup or paste. A new capture replaces the preview owner; hiding
 clears it. GNOME requires the updated HEX extension to load (log out/in if needed);
